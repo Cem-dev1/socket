@@ -9,8 +9,15 @@ import {
 } from 'lucide-react';
 
 // Render üzerinde canlıya aldığın adres veya lokal ortam değişkeni
-const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || 'https://stuck-voice-hub.onrender.com';
+const getSocketUrl = () => {
+  const envUrl = process.env.NEXT_PUBLIC_SOCKET_URL || 'stuck-voice-hub.onrender.com';
+  if (envUrl.startsWith('http://') || envUrl.startsWith('https://')) {
+    return envUrl;
+  }
+  return `https://${envUrl}`;
+};
 
+const SOCKET_URL = getSocketUrl();
 let socket;
 
 const CHANNELS = [
