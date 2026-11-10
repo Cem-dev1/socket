@@ -8,12 +8,11 @@ import {
   MessageSquare, Send, Signal, Sliders, ChevronDown, Compass, LayoutGrid
 } from 'lucide-react';
 
-// Render üzerinde canlıya aldığın adres veya lokal ortam değişkeni
+// Kesin çözüm: İçinde geçen tüm hatalı protokolleri kökten temizler
 const getSocketUrl = () => {
-  const envUrl = process.env.NEXT_PUBLIC_SOCKET_URL || 'stuck-voice-hub.onrender.com';
-  if (envUrl.startsWith('http://') || envUrl.startsWith('https://')) {
-    return envUrl;
-  }
+  let envUrl = process.env.NEXT_PUBLIC_SOCKET_URL || 'stuck-voice-hub.onrender.com';
+  // Eğer başında http://, https:// veya https/ varsa temizle
+  envUrl = envUrl.replace(/^https?:\/\//i, '').replace(/^https\/+/i, '').trim();
   return `https://${envUrl}`;
 };
 
