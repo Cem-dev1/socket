@@ -39,13 +39,13 @@ app.prepare().then(() => {
       currentRoom = roomId;
       socket.join(roomId);
       socket.to(roomId).emit('user-connected', socket.id);
+    });
 
-      socket.on('disconnect', () => {
-        if (currentRoom) {
-          socket.to(currentRoom).emit('user-disconnected', socket.id);
-        }
-        console.log('Kullanıcı ayrıldı:', socket.id);
-      });
+    socket.on('disconnect', () => {
+      if (currentRoom) {
+        socket.to(currentRoom).emit('user-disconnected', socket.id);
+      }
+      console.log('Kullanıcı ayrıldı:', socket.id);
     });
 
     socket.on('update-seat', (data) => {
