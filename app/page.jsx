@@ -5,7 +5,7 @@ import { io } from 'socket.io-client';
 import { 
   Mic, MicOff, Video, VideoOff, Monitor, MonitorOff, 
   PhoneOff, Volume2, VolumeX, Hash, Settings, Users, Sparkles, Radio, 
-  MessageSquare, Send, Signal, Sliders, ChevronDown, Compass, LayoutGrid
+  MessageSquare, Send, Signal, Sliders, ChevronDown, Compass, LayoutGrid, Maximize2
 } from 'lucide-react';
 
 const getSocketUrl = () => {
@@ -407,7 +407,9 @@ export default function DiscordVoiceApp() {
     { x: -110, y: -60, pan: -0.6 }
   ];
 
-  const isAnyStreamActive = isScreenSharing || isVideoOn || peers.some(p => p.stream?.getVideoTracks()?.length > 0);
+  // Aktif yayın yapan veya ekran paylaşan ilk peer'ı bul
+  const activePeerWithVideo = peers.find(p => p.stream?.getVideoTracks()?.length > 0);
+  const isLocalBroadcasting = isVideoOn || isScreenSharing;
 
   return (
     <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none">
@@ -540,33 +542,71 @@ export default function DiscordVoiceApp() {
               </div>
             ) : viewMode === 'grid' ? (
               <div className="w-full h-full flex flex-col md:flex-row gap-3">
-                <div className={`flex-1 rounded-xl bg-[#111214] border border-[#1f2023] relative overflow-hidden flex items-center justify-center shadow-2xl transition-all ${!isAnyStreamActive ? 'grid grid-cols-1 md:grid-cols-2 p-3 gap-3 bg-transparent border-none shadow-none' : ''}`}>
-                  <div className={`relative flex items-center justify-center overflow-hidden rounded-xl bg-[#111214] border border-[#1f2023] w-full h-full ${!isAnyStreamActive ? 'aspect-video' : ''}`}>
-                    <video 
-                      ref={localVideoRef} 
-                      autoPlay 
-                      playsInline 
-                      muted={true} 
-                      className={`w-full h-full object-contain bg-black ${isVideoOn || isScreenSharing ? 'block' : 'hidden'}`} 
-                    />
-                    {!(isVideoOn || isScreenSharing) && (
-                      <div className="flex flex-col items-center gap-2">
-                        <div className={`w-20 h-20 rounded-full bg-[#5865f2] flex items-center justify-center text-white font-bold text-2xl shadow-xl transition-all ${isSpeaking ? 'ring-4 ring-[#23a55a]' : 'ring-4 ring-[#5865f2]/20'}`}>
+                
+                {/* ANA BÜYÜK EKRAN ALANI: Eğer karşı taraf yayın yapıyorsa veya sen yayın yapıyorsan büyük alanı kaplar */}
+                <div className="flex-1 rounded-xl bg-[#111214] border border-[#1f2023] relative overflow-hidden flex items-center justify-center shadow-2xl">
+                  
+                  {activePeerWithVideo ? (
+                    <MainStreamViewer stream={activePeerWithVideo.stream} id={activePeerWithVideo.id} isDeafened={isDeafened} />
+                  ) : isLocalBroadcasting ? (
+                    <div className="relative w-full h-full flex items-center justify-center bg-black">
+                      <video ref={localVideoRef} autoPlay playsInline muted={true} className="w-full h-full object-contain" />
+                      <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-md text-xs text-white font-medium border border-white/10 z-10">
+                        <span className="w-2 h-2 rounded-full bg-[#23a55a]" /> Sen {isScreenSharing ? '(Ekran Paylaşımı)' : '(Kamera)'}
+                      </div>
+                    </div>
+                  ) : (
+                    /* Kimse yayın açmadıysa standart profil kartları görünümü */
+                    <div className="w-full h-full grid grid-cols-1 md:grid-cols-2 p-4 gap-4 items-center justify-center">
+                      <div className="relative flex flex-col items-center justify-center rounded-xl bg-[#1e1f22] border border-[#2b2d31] w-full h-full aspect-video">
+                        <div className={`w-20 h-20 rounded-full bg-[#5865f2] flex items-center justify-center text-white font-bold text-2xl shadow-xl transition-all ${isSpeaking ? 'ring-4 ring-[#23a55a]' : ''}`}>
                           KC
                         </div>
-                        <span className="text-sm font-semibold text-[#dbdee1]">Cem Dev</span>
+                        <span className="text-sm font-semibold text-[#dbdee1] mt-2">Cem Dev (Sen)</span>
+                        <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-md text-xs text-white font-medium border border-white/10">
+                          <span className="w-2 h-2 rounded-full bg-[#23a55a]" /> Ses Bağlı
+                        </div>
                       </div>
-                    )}
-                    <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-md text-xs text-white font-medium flex items-center gap-2 border border-white/10 z-10">
-                      <span className="w-2 h-2 rounded-full bg-[#23a55a]" />
-                      Sen {isScreenSharing ? '(Canlı Yayın)' : isVideoOn ? '(Kamera)' : ''}
+
+                      {peers.map((peer) => (
+                        <RemoteUserCard 
+                          key={peer.id} 
+                          stream={peer.stream} 
+                          id={peer.id} 
+                          isDeafened={isDeafened} 
+                          volume={userVolumes[peer.id] ?? 1}
+                          onVolumeChange={updatePeerVolume}
+                        />
+                      ))}
                     </div>
-                  </div>
+                  )}
                 </div>
 
-                {isAnyStreamActive && (
+                {/* YAN KÜÇÜK LİSTE (Sidebar): Biri yayın açtığında diğer kullanıcılar veya sen yanda küçük görünürsün */}
+                {(activePeerWithVideo || isLocalBroadcasting) && (
                   <div className="w-full md:w-64 flex md:flex-col gap-2 overflow-y-auto shrink-0">
-                    {peers.map((peer) => (
+                    {/* Eğer başkası yayın açtıysa, sen yanda küçük görün */}
+                    {activePeerWithVideo && (
+                      <div className="relative flex flex-col items-center justify-center rounded-xl bg-[#111214] border border-[#1f2023] h-36 w-full overflow-hidden">
+                        <video 
+                          ref={(el) => { if (el && localStreamRef.current) el.srcObject = localStreamRef.current; }} 
+                          autoPlay 
+                          playsInline 
+                          muted={true} 
+                          className={`w-full h-full object-contain bg-black ${isLocalBroadcasting ? 'block' : 'hidden'}`} 
+                        />
+                        {!isLocalBroadcasting && (
+                          <div className="flex flex-col items-center gap-1">
+                            <div className="w-10 h-10 rounded-full bg-[#5865f2] flex items-center justify-center text-white font-bold text-xs">KC</div>
+                            <span className="text-xs text-[#949ba4]">Cem Dev (Sen)</span>
+                          </div>
+                        )}
+                        <div className="absolute bottom-2 left-2 bg-black/60 px-2 py-0.5 rounded text-[10px] text-white">Sen</div>
+                      </div>
+                    )}
+
+                    {/* Diğer katılımcılar */}
+                    {peers.filter(p => !activePeerWithVideo || p.id !== activePeerWithVideo.id).map((peer) => (
                       <RemoteUserCard 
                         key={peer.id} 
                         stream={peer.stream} 
@@ -579,16 +619,7 @@ export default function DiscordVoiceApp() {
                     ))}
                   </div>
                 )}
-                {!isAnyStreamActive && peers.map((peer) => (
-                  <RemoteUserCard 
-                    key={peer.id} 
-                    stream={peer.stream} 
-                    id={peer.id} 
-                    isDeafened={isDeafened} 
-                    volume={userVolumes[peer.id] ?? 1}
-                    onVolumeChange={updatePeerVolume}
-                  />
-                ))}
+
               </div>
             ) : (
               <div className="w-full h-full bg-[#111214] rounded-2xl border border-[#1f2023] relative flex items-center justify-center shadow-2xl overflow-hidden">
@@ -715,42 +746,53 @@ export default function DiscordVoiceApp() {
 
       </div>
 
-      {/* Ses ve Gürültü Ayarları Modalı */}
-      {showSettingsModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center">
-          <div className="bg-[#313338] w-[480px] rounded-2xl border border-[#1f2023] p-6 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between border-b border-[#1f2023] pb-3">
-              <h2 className="text-lg font-bold text-white flex items-center gap-2"><Sliders size={20} /> Ses ve Gürültü Ayarları</h2>
-              <button onClick={() => setShowSettingsModal(false)} className="text-[#b5bac1] hover:text-white">✕</button>
-            </div>
-            <div className="space-y-4">
-              <div>
-                <label className="text-xs font-bold text-[#949ba4] uppercase tracking-wider">Yapay Zeka Gürültü Baskılama</label>
-                <div className="mt-2 p-3 bg-[#2b2d31] rounded-lg border border-[#1f2023] flex items-center justify-between">
-                  <span className="text-sm text-white">Krisp / WebRTC Donanımsal Filtreleme</span>
-                  <span className="px-2.5 py-1 bg-[#23a55a]/20 text-[#23a55a] text-xs font-semibold rounded-full">Aktif</span>
-                </div>
-              </div>
-            </div>
-            <div className="pt-4 border-t border-[#1f2023] flex justify-end">
-              <button 
-                onClick={() => setShowSettingsModal(false)}
-                className="px-5 py-2 bg-[#5865f2] hover:bg-[#4752c4] text-white text-sm font-medium rounded-md transition-all"
-              >
-                Tamam
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
     </div>
   );
 }
 
-function RemoteUserCard({ stream, id, isDeafened, volume, onVolumeChange, isSmall }) {
+// Karşı tarafın yayınını büyük ekranda ve tam ekran seçeneğiyle gösteren bileşen
+function MainStreamViewer({ stream, id, isDeafened }) {
   const videoRef = useRef(null);
-  const [showVolumeSlider, setShowVolumeSlider] = useState(false);
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.muted = isDeafened;
+      videoRef.current.play().catch(err => console.log("Main play error:", err));
+    }
+  }, [stream, isDeafened]);
+
+  const toggleFullScreen = () => {
+    if (!document.fullscreenElement) {
+      containerRef.current?.requestFullscreen().catch(err => console.error(err));
+    } else {
+      document.exitFullscreen();
+    }
+  };
+
+  return (
+    <div ref={containerRef} className="relative w-full h-full flex items-center justify-center bg-black group">
+      <video ref={videoRef} autoPlay playsInline muted={isDeafened} className="w-full h-full object-contain" />
+      
+      <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-md text-xs text-white font-medium flex items-center gap-2 border border-white/10 z-10">
+        <span className="w-2 h-2 rounded-full bg-[#23a55a] animate-pulse" />
+        Kullanıcı Yayını ({id.slice(0, 4)})
+      </div>
+
+      <button 
+        onClick={toggleFullScreen}
+        className="absolute top-4 right-4 bg-black/60 hover:bg-black/80 text-white p-2 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity border border-white/10 flex items-center gap-1.5 text-xs"
+        title="Tam Ekran Yap"
+      >
+        <Maximize2 size={16} /> Tam Ekran
+      </button>
+    </div>
+  );
+}
+
+function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
+  const videoRef = useRef(null);
   const hasVideo = stream?.getVideoTracks()?.length > 0;
 
   useEffect(() => {
@@ -763,10 +805,7 @@ function RemoteUserCard({ stream, id, isDeafened, volume, onVolumeChange, isSmal
   }, [stream, isDeafened, volume]);
 
   return (
-    <div 
-      onContextMenu={(e) => { e.preventDefault(); setShowVolumeSlider(!showVolumeSlider); }}
-      className={`bg-[#111214] rounded-xl relative flex items-center justify-center border border-[#1f2023] overflow-hidden shadow-md transition-all ${isSmall ? 'h-36 w-full' : 'w-full h-full aspect-video'}`}
-    >
+    <div className={`bg-[#111214] rounded-xl relative flex items-center justify-center border border-[#1f2023] overflow-hidden shadow-md transition-all ${isSmall ? 'h-36 w-full' : 'w-full h-full aspect-video'}`}>
       <video ref={videoRef} autoPlay playsInline muted={isDeafened} className={`w-full h-full object-contain bg-black ${hasVideo ? 'block' : 'hidden'}`} />
       
       {!hasVideo && (

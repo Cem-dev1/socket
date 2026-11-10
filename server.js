@@ -4,8 +4,8 @@ const next = require('next');
 const { Server } = require('socket.io');
 
 const dev = process.env.NODE_ENV !== 'production';
-const hostname = '0.0.0.0'; // Render'ın dış ağ erişimi için zorunludur
-const port = process.env.PORT || 3000; // Render'ın atadığı portu dinamik alır
+const hostname = '0.0.0.0';
+const port = process.env.PORT || 3000;
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
@@ -22,10 +22,9 @@ app.prepare().then(() => {
     }
   });
 
-  // CORS izinleri eklenmiş Socket.io sunucusu
   const io = new Server(server, {
     cors: {
-      origin: "*", // Vercel ve tüm dış isteklerin bağlanmasına izin verir
+      origin: "*",
       methods: ["GET", "POST"],
       credentials: true
     }
@@ -34,17 +33,25 @@ app.prepare().then(() => {
   io.on('connection', (socket) => {
     console.log('Bir kullanıcı bağlandı:', socket.id);
 
+    let currentRoom = null;
+
     socket.on('join-room', (roomId) => {
+      currentRoom = roomId;
       socket.join(roomId);
       socket.to(roomId).emit('user-connected', socket.id);
 
       socket.on('disconnect', () => {
-        socket.to(roomId).emit('user-disconnected', socket.id);
+        if (currentRoom) {
+          socket.to(currentRoom).emit('user-disconnected', socket.id);
+        }
+        console.log('Kullanıcı ayrıldı:', socket.id);
       });
     });
 
     socket.on('update-seat', (data) => {
-      socket.to(socket.roomId).emit('seat-update', { userId: socket.id, seat: data.seat });
+      if (currentRoom) {
+        socket.to(currentRoom).emit('seat-update', { userId: socket.id, seat: data.seat });
+      }
     });
 
     socket.on('chat-message', (data) => {
