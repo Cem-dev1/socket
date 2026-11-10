@@ -408,10 +408,20 @@ export default function DiscordVoiceApp() {
   ];
 
   // Aktif yayın açan ilk karşı tarafı bul
-  const activePeerWithVideo = peers.find(p => p.stream?.getVideoTracks()?.length > 0);
-  const isLocalBroadcasting = isVideoOn || isScreenSharing;
-  const isAnyBroadcastActive = !!activePeerWithVideo || isLocalBroadcasting;
+// Sadece gerçekten canlı ve aktif video track'i olan peer'ları yayıncı kabul et
+  const activePeerWithVideo = peers.find(p => {
+    if (!p.stream) return false;
+    const videoTracks = p.stream.getVideoTracks();
+    return videoTracks.some(track => track.readyState === 'live' && track.enabled);
+  });
 
+  // Yerel kullanıcının gerçekten kamera veya ekran paylaşımı açık ve aktif mi?
+  const isLocalBroadcasting = (isVideoOn || isScreenSharing) && (
+    activeLocalStream && 
+    activeLocalStream.getVideoTracks().some(track => track.readyState === 'live' && track.enabled)
+  );
+
+  const isAnyBroadcastActive = !!activePeerWithVideo || isLocalBroadcasting;
   return (
     <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none">
       
