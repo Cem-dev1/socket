@@ -50,9 +50,17 @@ export default function DiscordVoiceApp() {
   const localVideoRef = useRef(null);
   const peerConnections = useRef({});
   const screenStreamRef = useRef(null);
+  const cameraStreamRef = useRef(null);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const chatBottomRef = useRef(null);
+
+  // Refs for latest state inside socket callbacks
+  const isVideoOnRef = useRef(false);
+  const isScreenSharingRef = useRef(false);
+
+  useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
+  useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
 
   useEffect(() => {
     socket = io(SOCKET_URL, {
@@ -73,7 +81,15 @@ export default function DiscordVoiceApp() {
 
       const pc = createPeerConnection(userId);
       if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
+        // Sadece ses track'lerini ekle — video yoksa video gönderme
+        const audioTracks = localStreamRef.current.getAudioTracks();
+        audioTracks.forEach((track) => pc.addTrack(track, localStreamRef.current));
+
+        // Eğer aktif bir video (kamera veya ekran) varsa onu da ekle
+        const outgoingVideoTrack = getOutgoingVideoTrack();
+        if (outgoingVideoTrack) {
+          pc.addTrack(outgoingVideoTrack, localStreamRef.current);
+        }
       }
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -83,7 +99,13 @@ export default function DiscordVoiceApp() {
     socket.on('offer', async (data) => {
       const pc = createPeerConnection(data.caller);
       if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
+        const audioTracks = localStreamRef.current.getAudioTracks();
+        audioTracks.forEach((track) => pc.addTrack(track, localStreamRef.current));
+
+        const outgoingVideoTrack = getOutgoingVideoTrack();
+        if (outgoingVideoTrack) {
+          pc.addTrack(outgoingVideoTrack, localStreamRef.current);
+        }
       }
       await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
       const answer = await pc.createAnswer();
@@ -101,7 +123,11 @@ export default function DiscordVoiceApp() {
     socket.on('ice-candidate', async (data) => {
       const pc = peerConnections.current[data.id];
       if (pc) {
-        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } catch (e) {
+          console.warn('ICE candidate eklenemedi:', e);
+        }
       }
     });
 
@@ -219,6 +245,17 @@ export default function DiscordVoiceApp() {
     } catch (e) {}
   };
 
+  // Yayında olan video track'i (öncelik: ekran paylaşımı > kamera)
+  const getOutgoingVideoTrack = () => {
+    if (isScreenSharingRef.current && screenStreamRef.current) {
+      return screenStreamRef.current.getVideoTracks()[0] || null;
+    }
+    if (isVideoOnRef.current && cameraStreamRef.current) {
+      return cameraStreamRef.current.getVideoTracks()[0] || null;
+    }
+    return null;
+  };
+
   const createPeerConnection = (userId) => {
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
@@ -250,6 +287,7 @@ export default function DiscordVoiceApp() {
       setActiveChannel(channelId);
       playSfx('join');
       
+      // SADECE SES AL - video track hiç oluşturulmasın
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           echoCancellation: true,
@@ -257,11 +295,9 @@ export default function DiscordVoiceApp() {
           autoGainControl: true,
           sampleRate: 48000
         }, 
-        video: true 
+        video: false
       });
 
-      stream.getVideoTracks()[0].enabled = false;
-      
       localStreamRef.current = stream;
       setActiveLocalStream(stream);
       setInCall(true);
@@ -276,9 +312,15 @@ export default function DiscordVoiceApp() {
     playSfx('leave');
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
     }
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current = null;
+    }
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((track) => track.stop());
+      cameraStreamRef.current = null;
     }
     Object.values(peerConnections.current).forEach((pc) => pc.close());
     peerConnections.current = {};
@@ -317,21 +359,69 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  const toggleVideo = () => {
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = !isVideoOn;
-        setIsVideoOn(!isVideoOn);
-        if (!isScreenSharing) {
-          setActiveLocalStream(localStreamRef.current);
-        }
+  // Kamera aç/kapat — track'i sadece açıkken peer'lere gönder
+  const toggleVideo = async () => {
+    if (!localStreamRef.current) return;
+
+    if (!isVideoOn) {
+      // Ekran paylaşımı açıksa önce onu kapat
+      if (isScreenSharingRef.current) {
+        stopScreenShare();
       }
+
+      try {
+        const camStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        cameraStreamRef.current = camStream;
+        const videoTrack = camStream.getVideoTracks()[0];
+
+        // Peer'lere video gönder
+        Object.values(peerConnections.current).forEach((pc) => {
+          const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
+          if (sender) {
+            sender.replaceTrack(videoTrack);
+          } else {
+            pc.addTrack(videoTrack, localStreamRef.current);
+          }
+        });
+
+        // Yerel önizleme için activeLocalStream'i güncelle (ses + video birleşik)
+        setActiveLocalStream(localStreamRef.current);
+        setIsVideoOn(true);
+
+        videoTrack.onended = () => {
+          if (isVideoOnRef.current) toggleVideo();
+        };
+      } catch (e) {
+        console.error('Kamera açılamadı:', e);
+      }
+    } else {
+      // Kamerayı kapat — track'i tamamen kaldır
+      const videoTrack = cameraStreamRef.current?.getVideoTracks()[0];
+      if (videoTrack) videoTrack.stop();
+      cameraStreamRef.current = null;
+
+      Object.values(peerConnections.current).forEach((pc) => {
+        const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
+        if (sender) sender.replaceTrack(null);
+      });
+
+      setIsVideoOn(false);
+      setActiveLocalStream(localStreamRef.current);
     }
   };
 
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
+      // Kamera açıksa önce kapat
+      if (isVideoOnRef.current) {
+        const camTrack = cameraStreamRef.current?.getVideoTracks()[0];
+        if (camTrack) camTrack.stop();
+        cameraStreamRef.current = null;
+        setIsVideoOn(false);
+      }
+
       try {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: {
@@ -343,9 +433,6 @@ export default function DiscordVoiceApp() {
         });
 
         screenStreamRef.current = screenStream;
-        setIsScreenSharing(true);
-        setActiveLocalStream(screenStream);
-
         const screenTrack = screenStream.getVideoTracks()[0];
 
         Object.values(peerConnections.current).forEach((pc) => {
@@ -357,8 +444,11 @@ export default function DiscordVoiceApp() {
           }
         });
 
+        setIsScreenSharing(true);
+        setActiveLocalStream(screenStream);
+
         screenTrack.onended = () => {
-          stopScreenShare();
+          if (isScreenSharingRef.current) stopScreenShare();
         };
       } catch (err) {
         console.error('Ekran paylaşımı hatası:', err);
@@ -371,18 +461,17 @@ export default function DiscordVoiceApp() {
   const stopScreenShare = () => {
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach((t) => t.stop());
+      screenStreamRef.current = null;
     }
     setIsScreenSharing(false);
-    if (localStreamRef.current) {
-      setActiveLocalStream(localStreamRef.current);
-      const localVideoTrack = localStreamRef.current.getVideoTracks()[0];
-      Object.values(peerConnections.current).forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-        if (sender && localVideoTrack) {
-          sender.replaceTrack(localVideoTrack);
-        }
-      });
-    }
+
+    // Peer'lerdeki video sender'ı null yap — video gönderme
+    Object.values(peerConnections.current).forEach((pc) => {
+      const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
+      if (sender) sender.replaceTrack(null);
+    });
+
+    setActiveLocalStream(localStreamRef.current);
   };
 
   const sendMessage = (e) => {
@@ -407,12 +496,12 @@ export default function DiscordVoiceApp() {
     { x: -110, y: -60, pan: -0.6 }
   ];
 
-// Sadece karşı tarafın gerçekten video track'i etkinse VE video aktif olarak akıyorsa yayıncı kabul et
+  // Sadece gerçekten canlı ve susturulmamış video track'i olan peer'leri yayıncı kabul et
   const activePeerWithVideo = peers.find(p => {
     if (!p.stream) return false;
     const videoTracks = p.stream.getVideoTracks();
-    // Hem track enabled olacak hem de readyState live olacak
-    return videoTracks.some(track => track.enabled && track.readyState === 'live');
+    // Remote track'lerde `enabled` her zaman true döner — onun yerine readyState ve muted kontrolü
+    return videoTracks.some(track => track.readyState === 'live' && !track.muted);
   });
 
   // Yerel kullanıcının gerçekten kamera veya ekran paylaşımı butonu açık mı?
@@ -813,16 +902,29 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
       videoRef.current.volume = volume;
       videoRef.current.play()
         .then(() => {
-          // Videonun gerçekten bir boyutu varsa (yani gerçek bir yayın/kamera ise) aktif et
+          // Remote track'lerde `enabled` her zaman true döner — readyState ve muted kontrolü yap
           const videoTracks = stream.getVideoTracks();
-          const hasLive = videoTracks.some(t => t.enabled && t.readyState === 'live');
+          const hasLive = videoTracks.some(t => t.readyState === 'live' && !t.muted);
           setHasActiveVideo(hasLive);
         })
         .catch(err => console.log("Remote play error:", err));
     }
   }, [stream, isDeafened, volume]);
 
-  const hasVideoTrack = stream?.getVideoTracks()?.some(t => t.enabled && t.readyState === 'live');
+  // Stream'deki canlı video track'lerini izle
+  useEffect(() => {
+    if (!stream) {
+      setHasActiveVideo(false);
+      return;
+    }
+    const check = () => {
+      const videoTracks = stream.getVideoTracks();
+      setHasActiveVideo(videoTracks.some(t => t.readyState === 'live' && !t.muted));
+    };
+    check();
+    const interval = setInterval(check, 1000);
+    return () => clearInterval(interval);
+  }, [stream]);
 
   return (
     <div className={`bg-[#111214] rounded-xl relative flex items-center justify-center border border-[#1f2023] overflow-hidden shadow-md transition-all ${isSmall ? 'h-full w-full' : 'w-full h-full aspect-video'}`}>
@@ -831,10 +933,10 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
         autoPlay 
         playsInline 
         muted={isDeafened} 
-        className={`w-full h-full object-contain bg-black ${hasVideoTrack ? 'block' : 'hidden'}`} 
+        className={`w-full h-full object-contain bg-black ${hasActiveVideo ? 'block' : 'hidden'}`} 
       />
       
-      {!hasVideoTrack && (
+      {!hasActiveVideo && (
         <div className="flex flex-col items-center gap-1">
           <div className="w-12 h-12 rounded-full bg-indigo-600 flex items-center justify-center text-white font-bold text-sm">
             {id.slice(0, 2).toUpperCase()}
