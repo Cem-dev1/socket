@@ -8,6 +8,9 @@ import {
   MessageSquare, Send, Signal, Sliders, ChevronDown, Compass, LayoutGrid
 } from 'lucide-react';
 
+// Render üzerinde canlıya aldığın adres veya lokal ortam değişkeni
+const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || 'https://stuck-voice-hub.onrender.com';
+
 let socket;
 
 const CHANNELS = [
@@ -50,7 +53,9 @@ export default function DiscordVoiceApp() {
   const chatBottomRef = useRef(null);
 
   useEffect(() => {
-    socket = io();
+    socket = io(SOCKET_URL, {
+      transports: ['polling', 'websocket']
+    });
 
     const pingInterval = setInterval(() => {
       setPing(Math.floor(Math.random() * 15) + 10);
@@ -116,7 +121,7 @@ export default function DiscordVoiceApp() {
 
     return () => {
       clearInterval(pingInterval);
-      socket.disconnect();
+      if (socket) socket.disconnect();
     };
   }, []);
 
@@ -368,24 +373,14 @@ export default function DiscordVoiceApp() {
     setUserVolumes((prev) => ({ ...prev, [peerId]: vol }));
   };
 
-  // Mekânsal Ses Hesaplama: Koltuk indekslerine göre X, Y konumları ve ses panning derecesi (-1 ile 1 arası)
-  // Masanın 6 koltuğu için açısal koordinatlar
   const seatCoordinates = [
-    { x: 0, y: -120, pan: 0 },    // 0: Üst
-    { x: 110, y: -60, pan: 0.6 },  // 1: Sağ Üst
-    { x: 110, y: 60, pan: 0.9 },   // 2: Sağ Alt
-    { x: 0, y: 120, pan: 0 },      // 3: Alt
-    { x: -110, y: 60, pan: -0.9 }, // 4: Sol Alt
-    { x: -110, y: -60, pan: -0.6 } // 5: Sol Üst
+    { x: 0, y: -120, pan: 0 },
+    { x: 110, y: -60, pan: 0.6 },
+    { x: 110, y: 60, pan: 0.9 },
+    { x: 0, y: 120, pan: 0 },
+    { x: -110, y: 60, pan: -0.9 },
+    { x: -110, y: -60, pan: -0.6 }
   ];
-
-  const getSpatialPan = (peerId) => {
-    const peerSeat = peerSeats[peerId] ?? 1;
-    const diff = (peerSeat - localSeat + 6) % 6;
-    if (diff === 1 || diff === 2) return 0.8; // Sağ taraf
-    if (diff === 4 || diff === 5) return -0.8; // Sol taraf
-    return 0; // Karşı veya aynı
-  };
 
   const isAnyStreamActive = isScreenSharing || isVideoOn || peers.some(p => p.stream?.getVideoTracks()?.length > 0);
 
@@ -459,7 +454,7 @@ export default function DiscordVoiceApp() {
       {/* Ana Sahne */}
       <div className="flex-1 flex flex-col bg-[#313338] relative min-w-0">
         
-        {/* Üst Bar ve Görünüm Modu Değiştirici */}
+        {/* Üst Bar */}
         <div className="h-12 border-b border-[#1f2023] flex items-center justify-between px-4 font-bold text-white bg-[#313338] shadow-sm shrink-0">
           <div className="flex items-center gap-2">
             <Hash size={20} className="text-[#80848e]" />
@@ -501,7 +496,7 @@ export default function DiscordVoiceApp() {
           </div>
         </div>
 
-        {/* Ana İçerik / Görünüm */}
+        {/* Ana İçerik */}
         <div className="flex-1 flex min-h-0 relative overflow-hidden">
           
           <div className="flex-1 p-3 flex gap-3 min-h-0 relative overflow-hidden items-center justify-center">
@@ -519,7 +514,6 @@ export default function DiscordVoiceApp() {
                 </button>
               </div>
             ) : viewMode === 'grid' ? (
-              // 1. Klasik Grid Modu
               <div className="w-full h-full flex flex-col md:flex-row gap-3">
                 <div className={`flex-1 rounded-xl bg-[#111214] border border-[#1f2023] relative overflow-hidden flex items-center justify-center shadow-2xl transition-all ${!isAnyStreamActive ? 'grid grid-cols-1 md:grid-cols-2 p-3 gap-3 bg-transparent border-none shadow-none' : ''}`}>
                   <div className={`relative flex items-center justify-center overflow-hidden rounded-xl bg-[#111214] border border-[#1f2023] w-full h-full ${!isAnyStreamActive ? 'aspect-video' : ''}`}>
@@ -572,18 +566,15 @@ export default function DiscordVoiceApp() {
                 ))}
               </div>
             ) : (
-              // 2. YENİ: Masa & Mekânsal Ses Modu (Spatial Audio / Proximity)
               <div className="w-full h-full bg-[#111214] rounded-2xl border border-[#1f2023] relative flex items-center justify-center shadow-2xl overflow-hidden">
                 <div className="absolute top-6 left-6 bg-[#1e1f22]/80 backdrop-blur-md border border-[#2b2d31] px-4 py-2 rounded-xl text-xs text-[#949ba4] flex items-center gap-2 z-20">
                   <Compass size={16} className="text-[#23a55a] animate-spin" />
                   <span>Mekânsal Ses Aktif: Masadaki koltuğunu değiştirerek ses yönünü ve uzaklığını ayarlayabilirsin.</span>
                 </div>
 
-                {/* Yuvarlak Masa */}
                 <div className="w-64 h-64 rounded-full border-4 border-dashed border-[#35363c] bg-[#1a1b1e] flex items-center justify-center relative shadow-inner">
                   <span className="text-xs font-bold text-[#80848e] tracking-widest uppercase">Stuck Conference</span>
 
-                  {/* 6 Adet Koltuk Yerleşimi */}
                   {seatCoordinates.map((seat, idx) => {
                     const isMySeat = localSeat === idx;
                     const occupantPeer = peers.find(p => (peerSeats[p.id] ?? 1) === idx);
@@ -762,30 +753,9 @@ function RemoteUserCard({ stream, id, isDeafened, volume, onVolumeChange, isSmal
         </div>
       )}
       
-      <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] text-white font-medium border border-white/10 flex items-center gap-2">
-        <span>Kullanıcı ({id.slice(0, 4)})</span>
+      <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] text-white font-medium border border-white/10 z-10">
+        Kullanıcı ({id.slice(0, 4)})
       </div>
-
-      {showVolumeSlider && (
-        <div className="absolute inset-0 bg-black/80 backdrop-blur-sm z-30 flex flex-col items-center justify-center p-4 gap-2">
-          <span className="text-xs text-white font-bold">Kullanıcı Ses Seviyesi</span>
-          <input 
-            type="range" 
-            min="0" 
-            max="1" 
-            step="0.05" 
-            value={volume} 
-            onChange={(e) => onVolumeChange(id, parseFloat(e.target.value))}
-            className="w-32 accent-[#5865f2] cursor-pointer"
-          />
-          <button 
-            onClick={() => setShowVolumeSlider(false)} 
-            className="mt-2 px-3 py-1 bg-[#2b2d31] hover:bg-[#35373c] text-white text-xs rounded-md"
-          >
-            Kapat
-          </button>
-        </div>
-      )}
     </div>
   );
 }
