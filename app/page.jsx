@@ -407,20 +407,20 @@ export default function DiscordVoiceApp() {
     { x: -110, y: -60, pan: -0.6 }
   ];
 
-// Sadece tarayıcıda gerçekten video akışı üreten (boyutları olan veya yayında olan) track'leri kabul et
+// Sadece karşı tarafın gerçekten video track'i etkinse VE video aktif olarak akıyorsa yayıncı kabul et
   const activePeerWithVideo = peers.find(p => {
     if (!p.stream) return false;
     const videoTracks = p.stream.getVideoTracks();
-    // Hem etkin olacak, hem canlı olacak, hem de video stream'i ürettiğini onaylayacağız
+    // Hem track enabled olacak hem de readyState live olacak
     return videoTracks.some(track => track.enabled && track.readyState === 'live');
   });
-  // Yerel kullanıcının gerçekten kamera veya ekran paylaşımı açık ve aktif mi?
-  const isLocalBroadcasting = (isVideoOn || isScreenSharing) && (
-    activeLocalStream && 
-    activeLocalStream.getVideoTracks().some(track => track.readyState === 'live' && track.enabled)
-  );
 
+  // Yerel kullanıcının gerçekten kamera veya ekran paylaşımı butonu açık mı?
+  const isLocalBroadcasting = isVideoOn || isScreenSharing;
+
+  // Gerçek anlamda aktif bir yayın var mı?
   const isAnyBroadcastActive = !!activePeerWithVideo || isLocalBroadcasting;
+
   return (
     <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none">
       
@@ -804,22 +804,37 @@ function MainStreamViewer({ stream, id, isDeafened }) {
 
 function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
   const videoRef = useRef(null);
-  const hasVideo = stream?.getVideoTracks()?.length > 0;
+  const [hasActiveVideo, setHasActiveVideo] = useState(false);
 
   useEffect(() => {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = isDeafened;
       videoRef.current.volume = volume;
-      videoRef.current.play().catch(err => console.log("Remote play error:", err));
+      videoRef.current.play()
+        .then(() => {
+          // Videonun gerçekten bir boyutu varsa (yani gerçek bir yayın/kamera ise) aktif et
+          const videoTracks = stream.getVideoTracks();
+          const hasLive = videoTracks.some(t => t.enabled && t.readyState === 'live');
+          setHasActiveVideo(hasLive);
+        })
+        .catch(err => console.log("Remote play error:", err));
     }
   }, [stream, isDeafened, volume]);
 
+  const hasVideoTrack = stream?.getVideoTracks()?.some(t => t.enabled && t.readyState === 'live');
+
   return (
     <div className={`bg-[#111214] rounded-xl relative flex items-center justify-center border border-[#1f2023] overflow-hidden shadow-md transition-all ${isSmall ? 'h-full w-full' : 'w-full h-full aspect-video'}`}>
-      <video ref={videoRef} autoPlay playsInline muted={isDeafened} className={`w-full h-full object-contain bg-black ${hasVideo ? 'block' : 'hidden'}`} />
+      <video 
+        ref={videoRef} 
+        autoPlay 
+        playsInline 
+        muted={isDeafened} 
+        className={`w-full h-full object-contain bg-black ${hasVideoTrack ? 'block' : 'hidden'}`} 
+      />
       
-      {!hasVideo && (
+      {!hasVideoTrack && (
         <div className="flex flex-col items-center gap-1">
           <div className="w-12 h-12 rounded-full bg-indigo-600 flex items-center justify-center text-white font-bold text-sm">
             {id.slice(0, 2).toUpperCase()}
