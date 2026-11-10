@@ -22,7 +22,14 @@ app.prepare().then(() => {
     }
   });
 
-  const io = new Server(server);
+  // CORS izinleri eklenmiş Socket.io sunucusu
+  const io = new Server(server, {
+    cors: {
+      origin: "*", // Vercel ve tüm dış isteklerin bağlanmasına izin verir
+      methods: ["GET", "POST"],
+      credentials: true
+    }
+  });
 
   io.on('connection', (socket) => {
     console.log('Bir kullanıcı bağlandı:', socket.id);
@@ -34,6 +41,14 @@ app.prepare().then(() => {
       socket.on('disconnect', () => {
         socket.to(roomId).emit('user-disconnected', socket.id);
       });
+    });
+
+    socket.on('update-seat', (data) => {
+      socket.to(socket.roomId).emit('seat-update', { userId: socket.id, seat: data.seat });
+    });
+
+    socket.on('chat-message', (data) => {
+      socket.broadcast.emit('chat-message', data);
     });
 
     socket.on('offer', (data) => {
