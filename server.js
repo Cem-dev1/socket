@@ -4,8 +4,8 @@ const next = require('next');
 const { Server } = require('socket.io');
 
 const dev = process.env.NODE_ENV !== 'production';
-const hostname = 'localhost';
-const port = 3000;
+const hostname = '0.0.0.0'; // Render'ın dış ağ erişimi için zorunludur
+const port = process.env.PORT || 3000; // Render'ın atadığı portu dinamik alır
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
@@ -49,7 +49,7 @@ app.prepare().then(() => {
     });
   });
 
-  server.listen(port, (err) => {
+  server.listen(port, hostname, (err) => {
     if (err) throw err;
     console.log(`> Hazır! Sunucu çalışıyor: http://${hostname}:${port}`);
   });
