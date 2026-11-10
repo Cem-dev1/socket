@@ -8,10 +8,8 @@ import {
   MessageSquare, Send, Signal, Sliders, ChevronDown, Compass, LayoutGrid
 } from 'lucide-react';
 
-// Kesin çözüm: İçinde geçen tüm hatalı protokolleri kökten temizler
 const getSocketUrl = () => {
-  let envUrl = process.env.NEXT_PUBLIC_SOCKET_URL || 'stuck-voice-hub.onrender.com';
-  // Eğer başında http://, https:// veya https/ varsa temizle
+  let envUrl = process.env.NEXT_PUBLIC_SOCKET_URL || 'socket-vhcw.onrender.com';
   envUrl = envUrl.replace(/^https?:\/\//i, '').replace(/^https\/+/i, '').trim();
   return `https://${envUrl}`;
 };
@@ -35,7 +33,6 @@ export default function DiscordVoiceApp() {
   const [activeLocalStream, setActiveLocalStream] = useState(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   
-  // Metin Sohbeti & Ayarlar
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [showChat, setShowChat] = useState(true);
@@ -43,10 +40,9 @@ export default function DiscordVoiceApp() {
   const [userVolumes, setUserVolumes] = useState({});
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
-  // Mekânsal Ses / Masa Modu State'leri
-  const [viewMode, setViewMode] = useState('grid'); // 'grid' veya 'spatial'
-  const [localSeat, setLocalSeat] = useState(0); // Masadaki koltuk pozisyonu (0-5 arası)
-  const [peerSeats, setPeerSeats] = useState({}); // { peerId: seatIndex }
+  const [viewMode, setViewMode] = useState('grid');
+  const [localSeat, setLocalSeat] = useState(0);
+  const [peerSeats, setPeerSeats] = useState({});
 
   const [peers, setPeers] = useState([]);
 
@@ -69,6 +65,12 @@ export default function DiscordVoiceApp() {
 
     socket.on('user-connected', async (userId) => {
       playSfx('join');
+      setMessages((prev) => [...prev, { 
+        user: 'Sistem', 
+        text: `Kullanıcı odaya katıldı (${userId.slice(0, 4)})`, 
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
+      }]);
+
       const pc = createPeerConnection(userId);
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
@@ -113,6 +115,12 @@ export default function DiscordVoiceApp() {
 
     socket.on('user-disconnected', (userId) => {
       playSfx('leave');
+      setMessages((prev) => [...prev, { 
+        user: 'Sistem', 
+        text: `Kullanıcı odadan ayrıldı (${userId.slice(0, 4)})`, 
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
+      }]);
+
       if (peerConnections.current[userId]) {
         peerConnections.current[userId].close();
         delete peerConnections.current[userId];
@@ -135,7 +143,6 @@ export default function DiscordVoiceApp() {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, showChat]);
 
-  // Web Audio API ile Yankısız Konuşma Algılama
   useEffect(() => {
     if (!activeLocalStream || isMuted || isDeafened) {
       setIsSpeaking(false);
@@ -227,7 +234,10 @@ export default function DiscordVoiceApp() {
 
     pc.ontrack = (event) => {
       setPeers((prev) => {
-        if (prev.find((p) => p.id === userId)) return prev;
+        const existing = prev.find((p) => p.id === userId);
+        if (existing) {
+          return prev.map(p => p.id === userId ? { ...p, stream: event.streams[0] } : p);
+        }
         return [...prev, { id: userId, stream: event.streams[0] }];
       });
     };
@@ -363,7 +373,16 @@ export default function DiscordVoiceApp() {
       screenStreamRef.current.getTracks().forEach((t) => t.stop());
     }
     setIsScreenSharing(false);
-    setActiveLocalStream(localStreamRef.current);
+    if (localStreamRef.current) {
+      setActiveLocalStream(localStreamRef.current);
+      const localVideoTrack = localStreamRef.current.getVideoTracks()[0];
+      Object.values(peerConnections.current).forEach((pc) => {
+        const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
+        if (sender && localVideoTrack) {
+          sender.replaceTrack(localVideoTrack);
+        }
+      });
+    }
   };
 
   const sendMessage = (e) => {
@@ -625,10 +644,10 @@ export default function DiscordVoiceApp() {
                 {messages.map((m, idx) => (
                   <div key={idx} className="flex flex-col">
                     <div className="flex items-baseline gap-2">
-                      <span className="text-xs font-bold text-white">{m.user}</span>
+                      <span className={`text-xs font-bold ${m.user === 'Sistem' ? 'text-[#23a55a]' : 'text-white'}`}>{m.user}</span>
                       <span className="text-[10px] text-[#949ba4]">{m.time}</span>
                     </div>
-                    <span className="text-sm text-[#dbdee1] mt-0.5 break-words">{m.text}</span>
+                    <span className={`text-sm mt-0.5 break-words ${m.user === 'Sistem' ? 'text-[#23a55a]/90 italic text-xs' : 'text-[#dbdee1]'}`}>{m.text}</span>
                   </div>
                 ))}
                 <div ref={chatBottomRef} />
