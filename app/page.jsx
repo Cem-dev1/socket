@@ -407,14 +407,13 @@ export default function DiscordVoiceApp() {
     { x: -110, y: -60, pan: -0.6 }
   ];
 
-  // Aktif yayın açan ilk karşı tarafı bul
-// Sadece gerçekten canlı ve aktif video track'i olan peer'ları yayıncı kabul et
+// Sadece tarayıcıda gerçekten video akışı üreten (boyutları olan veya yayında olan) track'leri kabul et
   const activePeerWithVideo = peers.find(p => {
     if (!p.stream) return false;
     const videoTracks = p.stream.getVideoTracks();
-    return videoTracks.some(track => track.readyState === 'live' && track.enabled);
+    // Hem etkin olacak, hem canlı olacak, hem de video stream'i ürettiğini onaylayacağız
+    return videoTracks.some(track => track.enabled && track.readyState === 'live');
   });
-
   // Yerel kullanıcının gerçekten kamera veya ekran paylaşımı açık ve aktif mi?
   const isLocalBroadcasting = (isVideoOn || isScreenSharing) && (
     activeLocalStream && 
