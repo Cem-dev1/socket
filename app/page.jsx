@@ -5,7 +5,8 @@ import { io } from 'socket.io-client';
 import { 
   Mic, MicOff, Video, VideoOff, Monitor, MonitorOff, 
   PhoneOff, Volume2, VolumeX, Hash, Settings, Users, Sparkles, Radio, 
-  MessageSquare, Send, Signal, Sliders, ChevronDown, Compass, LayoutGrid, Maximize2
+  MessageSquare, Send, Signal, Sliders, ChevronDown, Compass, LayoutGrid, Maximize2,
+  Loader2, Wifi, WifiOff, Server
 } from 'lucide-react';
 
 const getSocketUrl = () => {
@@ -38,6 +39,11 @@ const VIDEO_CONSTRAINTS = {
 };
 
 export default function DiscordVoiceApp() {
+  // ✅ Bağlantı durumu
+  const [connectionState, setConnectionState] = useState('connecting'); // 'connecting' | 'connected' | 'waking' | 'error'
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const [connectionWaitTime, setConnectionWaitTime] = useState(0);
+
   const [activeChannel, setActiveChannel] = useState('genel-oda');
   const [inCall, setInCall] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
@@ -51,11 +57,10 @@ export default function DiscordVoiceApp() {
   const [newMessage, setNewMessage] = useState('');
   const [showChat, setShowChat] = useState(true);
   const [ping, setPing] = useState(14);
-  const [userVolumes, setUserVolumes] = useState({}); // { userId: 0.0 - 2.0 }
+  const [userVolumes, setUserVolumes] = useState({});
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
-  // ✅ Sağ tık menü state
-  const [contextMenu, setContextMenu] = useState(null); // { userId, x, y }
+  const [contextMenu, setContextMenu] = useState(null);
 
   const [viewMode, setViewMode] = useState('grid');
   const [localSeat, setLocalSeat] = useState(0);
@@ -92,6 +97,24 @@ export default function DiscordVoiceApp() {
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
   useEffect(() => { inCallRef.current = inCall; }, [inCall]);
   useEffect(() => { myIdRef.current = myId; }, [myId]);
+
+  // ✅ Bağlantı bekleme sayacı — "sunucu uyanıyor" mesajı
+  useEffect(() => {
+    if (connectionState === 'connected') {
+      setConnectionWaitTime(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      setConnectionWaitTime((prev) => {
+        const next = prev + 1;
+        if (next >= 5 && connectionState === 'connecting') {
+          setConnectionState('waking');
+        }
+        return next;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [connectionState]);
 
   // ✅ Sağ tık menü dışına tıklayınca kapat
   useEffect(() => {
@@ -173,7 +196,6 @@ export default function DiscordVoiceApp() {
     };
 
     pc.ontrack = (event) => {
-      console.log(`[WebRTC] Track - peer: ${userId}, tür: ${event.track.kind}, muted: ${event.track.muted}`);
       const remoteStream = event.streams[0];
       
       const updatePeer = () => {
@@ -193,7 +215,6 @@ export default function DiscordVoiceApp() {
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`[WebRTC] ${userId}: ${pc.connectionState}`);
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         if (peerConnections.current[userId] === pc) {
           pc.close();
@@ -236,7 +257,6 @@ export default function DiscordVoiceApp() {
       }
       await pc.setLocalDescription(offer);
       socketRef.current.emit('offer', { target: userId, signal: pc.localDescription });
-      console.log(`[Offer] Gönderildi: ${userId}`);
     } catch (e) {
       console.error('Offer hatası:', e);
     } finally {
@@ -278,22 +298,44 @@ export default function DiscordVoiceApp() {
   useEffect(() => {
     if (socketRef.current) return;
 
+    setConnectionState('connecting');
+
     const newSocket = io(SOCKET_URL, {
       transports: ['polling', 'websocket'],
       reconnection: true,
-      reconnectionAttempts: 10,
-      reconnectionDelay: 1000,
+      reconnectionAttempts: 20,
+      reconnectionDelay: 2000,
+      reconnectionDelayMax: 5000,
+      timeout: 20000,
     });
     socketRef.current = newSocket;
 
     newSocket.on('connect', () => {
       setMyId(newSocket.id);
       myIdRef.current = newSocket.id;
+      setConnectionState('connected');
+      setConnectionAttempt(0);
+      setConnectionWaitTime(0);
       console.log('✅ Socket bağlandı:', newSocket.id);
+    });
+
+    newSocket.on('disconnect', (reason) => {
+      console.log('🔌 Bağlantı kesildi:', reason);
+      if (reason !== 'io client disconnect') {
+        setConnectionState('connecting');
+      }
     });
 
     newSocket.on('connect_error', (err) => {
       console.error('❌ Socket hatası:', err.message);
+      setConnectionAttempt((prev) => prev + 1);
+      if (connectionWaitTime >= 5) {
+        setConnectionState('waking');
+      }
+    });
+
+    newSocket.on('reconnect_attempt', (attempt) => {
+      setConnectionAttempt(attempt);
     });
 
     newSocket.on('room-list', (list) => {
@@ -529,6 +571,10 @@ export default function DiscordVoiceApp() {
   // ==================== ARAMA KONTROLLERİ ====================
   const startCall = async (channelId) => {
     if (inCallRef.current) return;
+    if (connectionState !== 'connected') {
+      alert('Sunucuya bağlanılıyor, lütfen bekleyin...');
+      return;
+    }
     inCallRef.current = true;
 
     const socket = socketRef.current;
@@ -631,7 +677,6 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ==================== KAMERA ====================
   const toggleVideo = async () => {
     if (!localStreamRef.current) return;
 
@@ -674,7 +719,6 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ==================== EKRAN PAYLAŞIMI ====================
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
       if (isVideoOnRef.current) {
@@ -747,16 +791,14 @@ export default function DiscordVoiceApp() {
     setNewMessage('');
   };
 
-  // ✅ Ses seviyesi güncelle
   const updatePeerVolume = (peerId, vol) => {
     setUserVolumes((prev) => ({ ...prev, [peerId]: vol }));
   };
 
-  // ✅ Sağ tık menüsünü aç
   const handleUserRightClick = (e, userId) => {
     e.preventDefault();
     e.stopPropagation();
-    if (userId === myId) return; // kendi sesini ayarlayamazsın
+    if (userId === myId) return;
     setContextMenu({
       userId,
       x: e.clientX,
@@ -788,7 +830,111 @@ export default function DiscordVoiceApp() {
     return roomList[channelId] || [];
   };
 
-  // ==================== JSX ====================
+  // ==================== LOADER EKRANI ====================
+  if (connectionState !== 'connected') {
+    return (
+      <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none items-center justify-center relative">
+        {/* Arka plan grid efekti */}
+        <div className="absolute inset-0 opacity-5" style={{
+          backgroundImage: 'radial-gradient(circle at 1px 1px, #dbdee1 1px, transparent 0)',
+          backgroundSize: '40px 40px'
+        }} />
+
+        <div className="relative z-10 flex flex-col items-center max-w-md px-6">
+          {/* Discord logosu */}
+          <div className="w-20 h-20 bg-[#5865f2] rounded-[28px] flex items-center justify-center shadow-2xl mb-8 animate-pulse">
+            <Sparkles size={40} className="text-white" />
+          </div>
+
+          <h1 className="text-2xl font-bold text-white mb-2">Stuck Voice Hub</h1>
+          <p className="text-sm text-[#949ba4] mb-8">Sesli sohbet platformu</p>
+
+          {/* Durum ikonu */}
+          <div className="w-16 h-16 rounded-full bg-[#2b2d31] border-2 border-[#35373c] flex items-center justify-center mb-6 relative">
+            {connectionState === 'waking' ? (
+              <Server size={28} className="text-[#faa61a] animate-pulse" />
+            ) : connectionState === 'error' ? (
+              <WifiOff size={28} className="text-[#ed4245]" />
+            ) : (
+              <Loader2 size={28} className="text-[#5865f2] animate-spin" />
+            )}
+            
+            {/* Dönen halka */}
+            <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-[#5865f2] animate-spin" 
+                 style={{ animationDuration: '1.5s' }} />
+          </div>
+
+          {/* Mesaj */}
+          <div className="text-center mb-6">
+            {connectionState === 'connecting' && connectionAttempt === 0 && (
+              <>
+                <p className="text-white font-semibold mb-1">Sunucuya bağlanılıyor</p>
+                <p className="text-xs text-[#949ba4]">Sesli sohbet için hazırlanıyor...</p>
+              </>
+            )}
+            
+            {connectionState === 'connecting' && connectionAttempt > 0 && (
+              <>
+                <p className="text-white font-semibold mb-1">Yeniden bağlanılıyor</p>
+                <p className="text-xs text-[#949ba4]">
+                  Deneme {connectionAttempt}... 
+                  {connectionAttempt > 2 && ' (sunucu uyanıyor olabilir)'}
+                </p>
+              </>
+            )}
+
+            {connectionState === 'waking' && (
+              <>
+                <p className="text-[#faa61a] font-semibold mb-1 flex items-center justify-center gap-2">
+                  <Server size={16} /> Sunucu uyanıyor
+                </p>
+                <p className="text-xs text-[#949ba4] leading-relaxed">
+                  Ücretsiz hosting ilk bağlantıda ~30 saniye sürebilir.<br />
+                  Lütfen sayfayı kapatmayın.
+                </p>
+              </>
+            )}
+
+            {connectionState === 'error' && (
+              <>
+                <p className="text-[#ed4245] font-semibold mb-1">Bağlantı hatası</p>
+                <p className="text-xs text-[#949ba4]">Sayfayı yenileyerek tekrar deneyin.</p>
+              </>
+            )}
+          </div>
+
+          {/* İlerleme çubuğu */}
+          <div className="w-full max-w-xs bg-[#1e1f22] rounded-full h-1.5 overflow-hidden mb-3">
+            <div 
+              className={`h-full rounded-full transition-all duration-500 ${
+                connectionState === 'waking' ? 'bg-[#faa61a]' : 'bg-[#5865f2]'
+              }`}
+              style={{ 
+                width: `${Math.min(connectionWaitTime * 8 + 10, 95)}%`,
+                animation: connectionState === 'waking' ? 'pulse 2s infinite' : 'none'
+              }} 
+            />
+          </div>
+
+          <p className="text-[10px] text-[#80848e]">
+            {connectionWaitTime > 0 ? `${connectionWaitTime}s` : 'Başlatılıyor...'}
+            {connectionState === 'waking' && ' · Sabırla bekleyin'}
+          </p>
+
+          {/* İpucu */}
+          {connectionState === 'waking' && (
+            <div className="mt-8 bg-[#2b2d31] border border-[#faa61a]/20 rounded-lg px-4 py-3 max-w-xs">
+              <p className="text-[11px] text-[#faa61a]/90 leading-relaxed text-center">
+                💡 Render free tier kullanılıyor. Sunucu 15 dakika boşta kalınca uyuyor. Bir kez uyandıktan sonra hızlı olacak.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ==================== ANA UYGULAMA ====================
   return (
     <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none">
       
@@ -1153,7 +1299,6 @@ export default function DiscordVoiceApp() {
 
       </div>
 
-      {/* ✅ Sağ Tık Ses Seviyesi Menüsü */}
       {contextMenu && (
         <div
           className="fixed z-[100] bg-[#111214] border border-[#2b2d31] rounded-lg shadow-2xl p-3 w-64"
@@ -1194,9 +1339,6 @@ export default function DiscordVoiceApp() {
               value={Math.round((userVolumes[contextMenu.userId] ?? 1) * 100)}
               onChange={(e) => updatePeerVolume(contextMenu.userId, parseInt(e.target.value) / 100)}
               className="w-full h-2 bg-[#2b2d31] rounded-lg appearance-none cursor-pointer accent-[#23a55a]"
-              style={{
-                background: `linear-gradient(to right, #23a55a 0%, #23a55a ${Math.min((userVolumes[contextMenu.userId] ?? 1) * 50, 100)}%, #2b2d31 ${Math.min((userVolumes[contextMenu.userId] ?? 1) * 50, 100)}%, #2b2d31 100%)`
-              }}
             />
 
             <div className="flex items-center justify-between gap-1 mt-1">
@@ -1247,7 +1389,7 @@ function MainStreamViewer({ stream, id, isDeafened, volume = 1 }) {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = isDeafened;
-      videoRef.current.volume = Math.min(Math.max(volume, 0), 1); // HTML5 video max 1.0
+      videoRef.current.volume = Math.min(Math.max(volume, 0), 1);
       videoRef.current.play().catch(() => {});
     }
   }, [stream, isDeafened, volume]);
@@ -1293,7 +1435,6 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = isDeafened;
-      // ✅ HTML5 video volume max 1.0 destekler, yukarısı için GainNode kullanılabilir
       videoRef.current.volume = Math.min(Math.max(volume, 0), 1);
       videoRef.current.play().catch(() => {});
     }
