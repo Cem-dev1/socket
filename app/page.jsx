@@ -78,15 +78,11 @@ export default function DiscordVoiceApp() {
   const inCallRef = useRef(false);
   const myIdRef = useRef(null);
 
-  // Perfect negotiation
   const politeFlags = useRef({});
   const makingOffer = useRef({});
   const ignoreOffer = useRef({});
   const pendingCandidates = useRef({});
-  
-  // ✅ Video sender'ları peer başına takip et
   const videoSenders = useRef({});
-  // ✅ Renegotiation kilidi
   const isRenegotiating = useRef({});
 
   useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
@@ -161,10 +157,9 @@ export default function DiscordVoiceApp() {
     };
 
     pc.ontrack = (event) => {
-      console.log(`[WebRTC] Track - peer: ${userId}, tür: ${event.track.kind}`);
+      console.log(`[WebRTC] Track - peer: ${userId}, tür: ${event.track.kind}, muted: ${event.track.muted}`);
       const remoteStream = event.streams[0];
       
-      // ✅ Track unmute olunca UI'ı güncelle
       const updatePeer = () => {
         setPeers((prev) => {
           const existing = prev.find((p) => p.id === userId);
@@ -175,8 +170,22 @@ export default function DiscordVoiceApp() {
         });
       };
       
-      event.track.onunmute = updatePeer;
-      event.track.onmute = updatePeer;
+      // Track durum değişikliklerini dinle
+      event.track.onunmute = () => {
+        console.log(`[WebRTC] Track unmuted - peer: ${userId}, tür: ${event.track.kind}`);
+        updatePeer();
+      };
+      event.track.onmute = () => {
+        console.log(`[WebRTC] Track muted - peer: ${userId}, tür: ${event.track.kind}`);
+        updatePeer();
+      };
+      event.track.onended = () => {
+        console.log(`[WebRTC] Track ended - peer: ${userId}, tür: ${event.track.kind}`);
+        // Track bittiyse stream'i güncelle
+        const remainingTracks = remoteStream.getTracks().filter(t => t !== event.track);
+        const newStream = new MediaStream(remainingTracks);
+        setPeers((prev) => prev.map(p => p.id === userId ? { ...p, stream: newStream } : p));
+      };
       
       updatePeer();
     };
@@ -193,14 +202,12 @@ export default function DiscordVoiceApp() {
       }
     };
 
-    // Ses track'lerini ekle
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((track) => {
         pc.addTrack(track, localStreamRef.current);
       });
     }
 
-    // ✅ Video track'i varsa EKLE (transceiver kullanma!)
     const activeVideo = getOutgoingVideoTrack();
     if (activeVideo) {
       const videoSender = pc.addTrack(activeVideo, localStreamRef.current);
@@ -214,14 +221,9 @@ export default function DiscordVoiceApp() {
   const sendOffer = async (userId) => {
     const pc = peerConnections.current[userId];
     if (!pc || !socketRef.current) return;
-    if (pc.signalingState !== 'stable') {
-      console.warn(`[Reneg] ${userId} stable değil: ${pc.signalingState}`);
-      return;
-    }
-    if (isRenegotiating.current[userId]) {
-      console.warn(`[Reneg] ${userId} zaten renegotiation yapılıyor`);
-      return;
-    }
+    if (pc.signalingState !== 'stable') return;
+    if (isRenegotiating.current[userId]) return;
+    
     isRenegotiating.current[userId] = true;
     try {
       makingOffer.current[userId] = true;
@@ -242,7 +244,6 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ✅ Video track'i peer'lere gönder (replaceTrack + gerekirse addTrack)
   const applyVideoToPeer = async (peerId, pc, videoTrack, stream) => {
     const sender = videoSenders.current[peerId];
     if (sender) {
@@ -256,7 +257,6 @@ export default function DiscordVoiceApp() {
       const newSender = pc.addTrack(videoTrack, stream);
       videoSenders.current[peerId] = newSender;
       console.log(`[Video] ${peerId} addTrack OK`);
-      // ✅ Yeni track eklendiği için renegotiation şart
       await new Promise(resolve => setTimeout(resolve, 100));
       await sendOffer(peerId);
     }
@@ -637,6 +637,7 @@ export default function DiscordVoiceApp() {
     if (!localStreamRef.current) return;
 
     if (!isVideoOn) {
+      // AÇMA
       if (isScreenSharingRef.current) stopScreenShare();
 
       try {
@@ -644,7 +645,6 @@ export default function DiscordVoiceApp() {
         cameraStreamRef.current = camStream;
         const videoTrack = camStream.getVideoTracks()[0];
 
-        // ✅ Peer'lere video track'i gönder
         for (const [peerId, pc] of Object.entries(peerConnections.current)) {
           await applyVideoToPeer(peerId, pc, videoTrack, localStreamRef.current);
         }
@@ -663,19 +663,33 @@ export default function DiscordVoiceApp() {
         console.error('Kamera açılamadı:', e);
       }
     } else {
+      // ✅ KAPATMA — replaceTrack(null) + RENEGOTIATION
       const videoTrack = cameraStreamRef.current?.getVideoTracks()[0];
       if (videoTrack) videoTrack.stop();
       cameraStreamRef.current = null;
 
-      for (const [peerId, pc] of Object.entries(peerConnections.current)) {
+      for (const [peerId] of Object.entries(peerConnections.current)) {
         const sender = videoSenders.current[peerId];
         if (sender) {
-          await sender.replaceTrack(null);
+          try {
+            await sender.replaceTrack(null);
+            console.log(`[Video Off] ${peerId} track null`);
+          } catch (e) {
+            console.error(`[Video Off] ${peerId} HATA:`, e);
+          }
         }
       }
 
       setIsVideoOn(false);
       setActiveLocalStream(localStreamRef.current);
+
+      // ✅ KRİTİK: Renegotiation — SDP'den msid kaldırılsın
+      await new Promise(resolve => setTimeout(resolve, 150));
+      for (const peerId of Object.keys(peerConnections.current)) {
+        if (peerConnections.current[peerId]) {
+          sendOffer(peerId).catch(err => console.error(`[Reneg Off] ${peerId}:`, err));
+        }
+      }
     }
   };
 
@@ -732,7 +746,7 @@ export default function DiscordVoiceApp() {
     }
     setIsScreenSharing(false);
 
-    for (const [peerId, pc] of Object.entries(peerConnections.current)) {
+    for (const [peerId] of Object.entries(peerConnections.current)) {
       const sender = videoSenders.current[peerId];
       if (sender) {
         sender.replaceTrack(null).catch(() => {});
@@ -740,6 +754,15 @@ export default function DiscordVoiceApp() {
     }
 
     setActiveLocalStream(localStreamRef.current);
+
+    // ✅ KRİTİK: Renegotiation
+    setTimeout(() => {
+      for (const peerId of Object.keys(peerConnections.current)) {
+        if (peerConnections.current[peerId]) {
+          sendOffer(peerId).catch(err => console.error(`[Reneg Screen Off] ${peerId}:`, err));
+        }
+      }
+    }, 150);
   };
 
   const sendMessage = (e) => {
@@ -1204,13 +1227,30 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
       setHasActiveVideo(false);
       return;
     }
+    
     const check = () => {
       const videoTracks = stream.getVideoTracks();
       setHasActiveVideo(videoTracks.some(t => t.readyState === 'live' && !t.muted));
     };
     check();
-    const interval = setInterval(check, 1000);
-    return () => clearInterval(interval);
+
+    // Track event'lerini dinle — hızlı reaksiyon
+    const videoTracks = stream.getVideoTracks();
+    videoTracks.forEach(t => {
+      t.onunmute = check;
+      t.onmute = check;
+      t.onended = check;
+    });
+
+    const interval = setInterval(check, 500);
+    return () => {
+      clearInterval(interval);
+      videoTracks.forEach(t => {
+        t.onunmute = null;
+        t.onmute = null;
+        t.onended = null;
+      });
+    };
   }, [stream]);
 
   return (
