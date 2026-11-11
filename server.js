@@ -10,6 +10,9 @@ const port = process.env.PORT || 3000;
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
+// Oda üyelerini takip et: roomId -> Set<socketId>
+const roomMembers = new Map();
+
 app.prepare().then(() => {
   const server = createServer(async (req, res) => {
     try {
@@ -23,11 +26,9 @@ app.prepare().then(() => {
   });
 
   const io = new Server(server, {
-    cors: {
-      origin: "*",
-      methods: ["GET", "POST"],
-      credentials: true
-    }
+    cors: { origin: '*', methods: ['GET', 'POST'], credentials: true },
+    pingTimeout: 60000,
+    pingInterval: 25000,
   });
 
   io.on('connection', (socket) => {
@@ -36,13 +37,41 @@ app.prepare().then(() => {
     let currentRoom = null;
 
     socket.on('join-room', (roomId) => {
+      // Eski odadan çık
+      if (currentRoom && currentRoom !== roomId) {
+        socket.leave(currentRoom);
+        const oldMembers = roomMembers.get(currentRoom);
+        if (oldMembers) {
+          oldMembers.delete(socket.id);
+          if (oldMembers.size === 0) roomMembers.delete(currentRoom);
+        }
+        socket.to(currentRoom).emit('user-disconnected', socket.id);
+      }
+
       currentRoom = roomId;
       socket.join(roomId);
+
+      if (!roomMembers.has(roomId)) roomMembers.set(roomId, new Set());
+      const members = roomMembers.get(roomId);
+
+      // ✅ Yeni gelen kişiye MEVCUT üyelerin listesini gönder
+      const existingMembers = Array.from(members);
+      socket.emit('existing-members', { members: existingMembers });
+
+      // Mevcut üyelere yeni geleni bildir
       socket.to(roomId).emit('user-connected', socket.id);
+
+      members.add(socket.id);
+      console.log(`[Oda ${roomId}] ${socket.id} katıldı. Toplam: ${members.size}`);
     });
 
     socket.on('disconnect', () => {
       if (currentRoom) {
+        const members = roomMembers.get(currentRoom);
+        if (members) {
+          members.delete(socket.id);
+          if (members.size === 0) roomMembers.delete(currentRoom);
+        }
         socket.to(currentRoom).emit('user-disconnected', socket.id);
       }
       console.log('Kullanıcı ayrıldı:', socket.id);
@@ -55,7 +84,10 @@ app.prepare().then(() => {
     });
 
     socket.on('chat-message', (data) => {
-      socket.broadcast.emit('chat-message', data);
+      if (currentRoom) {
+        socket.to(currentRoom).emit('chat-message', data);
+        // Kendine de gönder (UI'da zaten ekleniyor ama tutarlılık için)
+      }
     });
 
     socket.on('offer', (data) => {

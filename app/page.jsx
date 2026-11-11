@@ -23,7 +23,6 @@ const CHANNELS = [
   { id: 'tech-talk', name: 'Tech & Architecture' },
 ];
 
-// Güçlendirilmiş ses işleme kısıtları
 const AUDIO_CONSTRAINTS = {
   echoCancellation: true,
   noiseSuppression: true,
@@ -72,33 +71,39 @@ export default function DiscordVoiceApp() {
   const analyserRef = useRef(null);
   const chatBottomRef = useRef(null);
 
-  // Refs for latest state inside socket callbacks
   const isVideoOnRef = useRef(false);
   const isScreenSharingRef = useRef(false);
+  const inCallRef = useRef(false);
+
+  // ✅ Perfect negotiation için polite/impolite belirleme
+  // Her peer için "polite" olup olmadığımızı tutar
+  const politeFlags = useRef({});
+  const makingOffer = useRef({});
+  const ignoreOffer = useRef({});
+  const pendingCandidates = useRef({});
+  const localStreamVersion = useRef(0);
 
   useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
+  useEffect(() => { inCallRef.current = inCall; }, [inCall]);
 
   // ==================== SES İŞLEME ====================
   const applyAudioProcessing = async (rawStream) => {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     await audioCtx.resume();
-    audioContextRef.current = audioCtx; // referansı tut
+    audioContextRef.current = audioCtx;
 
     const source = audioCtx.createMediaStreamSource(rawStream);
 
-    // High-pass: fan, klavye, uğultu gibi düşük frekansları keser
     const highpass = audioCtx.createBiquadFilter();
     highpass.type = 'highpass';
     highpass.frequency.value = 85;
     highpass.Q.value = 0.7;
 
-    // Low-pass: tıslama, sibilance gibi yüksek frekansları keser
     const lowpass = audioCtx.createBiquadFilter();
     lowpass.type = 'lowpass';
     lowpass.frequency.value = 8000;
 
-    // Compressor: ani yüksek sesleri (bağırma, çarpma) dengeler
     const compressor = audioCtx.createDynamicsCompressor();
     compressor.threshold.value = -50;
     compressor.knee.value = 40;
@@ -107,25 +112,151 @@ export default function DiscordVoiceApp() {
     compressor.release.value = 0.25;
 
     const destination = audioCtx.createMediaStreamDestination();
-
     source.connect(highpass);
     highpass.connect(lowpass);
     lowpass.connect(compressor);
     compressor.connect(destination);
 
-    // İşlenmiş stream'i döndür
     return destination.stream;
   };
 
-  // ==================== SOCKET & WEBRTC ====================
+  // ==================== YARDIMCILAR ====================
+  const getOutgoingVideoTrack = () => {
+    if (isScreenSharingRef.current && screenStreamRef.current) {
+      return screenStreamRef.current.getVideoTracks()[0] || null;
+    }
+    if (isVideoOnRef.current && cameraStreamRef.current) {
+      return cameraStreamRef.current.getVideoTracks()[0] || null;
+    }
+    return null;
+  };
+
+  // ✅ Yerel stream'e video track ekle (replaceTrack için tek kaynak)
+  const rebuildLocalStream = () => {
+    if (!localStreamRef.current) return;
+    const audioTracks = localStreamRef.current.getAudioTracks();
+    const newStream = new MediaStream();
+    audioTracks.forEach(t => newStream.addTrack(t));
+    
+    const videoTrack = getOutgoingVideoTrack();
+    if (videoTrack) newStream.addTrack(videoTrack);
+    
+    localStreamRef.current = newStream;
+    setActiveLocalStream(newStream);
+    localStreamVersion.current += 1;
+  };
+
+  // ==================== PERFECT NEGOTIATION ====================
+  const createPeerConnection = (userId, isPolite = false) => {
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ],
+    });
+
+    peerConnections.current[userId] = pc;
+    politeFlags.current[userId] = isPolite;
+    makingOffer.current[userId] = false;
+    ignoreOffer.current[userId] = false;
+    pendingCandidates.current[userId] = [];
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit('ice-candidate', { target: userId, candidate: event.candidate });
+      }
+    };
+
+    pc.ontrack = (event) => {
+      console.log(`[WebRTC] Track - peer: ${userId}, tür: ${event.track.kind}`);
+      const remoteStream = event.streams[0];
+      
+      setPeers((prev) => {
+        const existing = prev.find((p) => p.id === userId);
+        if (existing) {
+          return prev.map(p => p.id === userId ? { ...p, stream: remoteStream } : p);
+        }
+        return [...prev, { id: userId, stream: remoteStream }];
+      });
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log(`[WebRTC] Peer ${userId} durumu: ${pc.connectionState}`);
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        // Bağlantı koptuysa yeniden kur
+        if (peerConnections.current[userId] === pc) {
+          pc.close();
+          delete peerConnections.current[userId];
+          setPeers((prev) => prev.filter((p) => p.id !== userId));
+        }
+      }
+    };
+
+    // ✅ Yerel track'leri ekle
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => {
+        pc.addTrack(track, localStreamRef.current);
+      });
+    }
+
+    // ✅ Video için boş transceiver oluştur (replaceTrack için hazır)
+    if (!getOutgoingVideoTrack()) {
+      pc.addTransceiver('video', { direction: 'sendrecv' });
+    }
+
+    return pc;
+  };
+
+  // ✅ Offer gönder (state kontrolü ile)
+  const sendOffer = async (userId) => {
+    const pc = peerConnections.current[userId];
+    if (!pc) return;
+    if (pc.signalingState !== 'stable') {
+      console.warn(`[Reneg] ${userId} için state stable değil: ${pc.signalingState}`);
+      return;
+    }
+    try {
+      makingOffer.current[userId] = true;
+      const offer = await pc.createOffer();
+      // State değişmiş olabilir, tekrar kontrol
+      if (pc.signalingState !== 'stable') {
+        makingOffer.current[userId] = false;
+        return;
+      }
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { target: userId, signal: pc.localDescription });
+    } catch (e) {
+      console.error('Offer hatası:', e);
+    } finally {
+      makingOffer.current[userId] = false;
+    }
+  };
+
+  // ==================== SOCKET ====================
   useEffect(() => {
     socket = io(SOCKET_URL, {
-      transports: ['polling', 'websocket']
+      transports: ['polling', 'websocket'],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
     });
 
     const pingInterval = setInterval(() => {
       setPing(Math.floor(Math.random() * 15) + 10);
     }, 4000);
+
+    // ✅ YENİ: Odaya girdiğimizde mevcut üyelerin listesini alırız
+    socket.on('existing-members', async ({ members }) => {
+      console.log('[Socket] Mevcut üyeler:', members);
+      for (const peerId of members) {
+        if (peerId === socket.id) continue;
+        if (!peerConnections.current[peerId]) {
+          // ✅ Biz "impolite" olalım — biz offer atarız
+          const pc = createPeerConnection(peerId, false);
+          await sendOffer(peerId);
+        }
+      }
+    });
 
     socket.on('user-connected', async (userId) => {
       playSfx('join');
@@ -135,53 +266,88 @@ export default function DiscordVoiceApp() {
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
       }]);
 
-      const pc = createPeerConnection(userId);
-      if (localStreamRef.current) {
-        const audioTracks = localStreamRef.current.getAudioTracks();
-        audioTracks.forEach((track) => pc.addTrack(track, localStreamRef.current));
-
-        const outgoingVideoTrack = getOutgoingVideoTrack();
-        if (outgoingVideoTrack) {
-          pc.addTrack(outgoingVideoTrack, localStreamRef.current);
-        }
+      // ✅ Yeni gelen kişi offer atacak, biz bekleyelim
+      // Ama yine de connection objesi oluştur (cevap alabilmek için)
+      if (!peerConnections.current[userId]) {
+        createPeerConnection(userId, true); // polite
       }
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('offer', { target: userId, signal: offer });
     });
 
     socket.on('offer', async (data) => {
-      const pc = createPeerConnection(data.caller);
-      if (localStreamRef.current) {
-        const audioTracks = localStreamRef.current.getAudioTracks();
-        audioTracks.forEach((track) => pc.addTrack(track, localStreamRef.current));
-
-        const outgoingVideoTrack = getOutgoingVideoTrack();
-        if (outgoingVideoTrack) {
-          pc.addTrack(outgoingVideoTrack, localStreamRef.current);
-        }
+      const { caller, signal } = data;
+      let pc = peerConnections.current[caller];
+      
+      // Yoksa oluştur — biz polite olalım (gelen offer'a boyun eğeriz)
+      if (!pc) {
+        pc = createPeerConnection(caller, true);
       }
-      await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit('answer', { target: data.caller, signal: answer });
+
+      try {
+        const offerCollision = makingOffer.current[caller] || pc.signalingState !== 'stable';
+        ignoreOffer.current[caller] = !politeFlags.current[caller] && offerCollision;
+
+        if (ignoreOffer.current[caller]) {
+          console.log(`[PerfectNeg] Offer ignore - peer: ${caller}`);
+          return;
+        }
+
+        // Polite taraf isek ve çakışma varsa rollback
+        if (offerCollision && politeFlags.current[caller]) {
+          await Promise.all([
+            pc.setLocalDescription({ type: 'rollback' }),
+            pc.setRemoteDescription(new RTCSessionDescription(signal)),
+          ]);
+        } else {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal));
+        }
+
+        // Bekleyen ICE candidate'leri ekle
+        for (const c of pendingCandidates.current[caller] || []) {
+          try { await pc.addIceCandidate(c); } catch (e) {}
+        }
+        pendingCandidates.current[caller] = [];
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('answer', { target: caller, signal: pc.localDescription });
+      } catch (e) {
+        console.error('[Offer] Hata:', e);
+      }
     });
 
     socket.on('answer', async (data) => {
       const pc = peerConnections.current[data.id];
-      if (pc) {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
+      if (!pc) return;
+      try {
+        if (pc.signalingState === 'have-local-offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
+          // Bekleyen ICE'leri ekle
+          for (const c of pendingCandidates.current[data.id] || []) {
+            try { await pc.addIceCandidate(c); } catch (e) {}
+          }
+          pendingCandidates.current[data.id] = [];
+        }
+      } catch (e) {
+        console.error('[Answer] Hata:', e);
       }
     });
 
     socket.on('ice-candidate', async (data) => {
       const pc = peerConnections.current[data.id];
-      if (pc) {
-        try {
+      if (!pc) {
+        if (!pendingCandidates.current[data.id]) pendingCandidates.current[data.id] = [];
+        pendingCandidates.current[data.id].push(new RTCIceCandidate(data.candidate));
+        return;
+      }
+      try {
+        if (pc.remoteDescription && pc.remoteDescription.type) {
           await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-        } catch (e) {
-          console.warn('ICE candidate eklenemedi:', e);
+        } else {
+          if (!pendingCandidates.current[data.id]) pendingCandidates.current[data.id] = [];
+          pendingCandidates.current[data.id].push(new RTCIceCandidate(data.candidate));
         }
+      } catch (e) {
+        if (e.name !== 'OperationError') console.warn('ICE hatası:', e);
       }
     });
 
@@ -204,6 +370,10 @@ export default function DiscordVoiceApp() {
       if (peerConnections.current[userId]) {
         peerConnections.current[userId].close();
         delete peerConnections.current[userId];
+        delete politeFlags.current[userId];
+        delete makingOffer.current[userId];
+        delete ignoreOffer.current[userId];
+        delete pendingCandidates.current[userId];
       }
       setPeers((prev) => prev.filter((p) => p.id !== userId));
       setPeerSeats((prev) => {
@@ -213,13 +383,19 @@ export default function DiscordVoiceApp() {
       });
     });
 
+    // ✅ Sayfa kapatılırken temizlik
+    const handleBeforeUnload = () => {
+      if (socket) socket.disconnect();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
     return () => {
       clearInterval(pingInterval);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
       if (socket) socket.disconnect();
     };
   }, []);
 
-  // ==================== CHAT SCROLL ====================
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, showChat]);
@@ -250,21 +426,15 @@ export default function DiscordVoiceApp() {
         if (!analyserRef.current) return;
         analyserRef.current.getByteFrequencyData(dataArray);
         let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          sum += dataArray[i];
-        }
-        let average = sum / bufferLength;
-        setIsSpeaking(average > 12);
+        for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
+        setIsSpeaking(sum / bufferLength > 12);
         animationId = requestAnimationFrame(checkAudioLevel);
       };
-
       checkAudioLevel();
 
       return () => {
         cancelAnimationFrame(animationId);
-        if (audioCtx && audioCtx.state !== 'closed') {
-          audioCtx.close();
-        }
+        if (audioCtx && audioCtx.state !== 'closed') audioCtx.close();
         speakingContextRef.current = null;
       };
     } catch (e) {
@@ -276,7 +446,7 @@ export default function DiscordVoiceApp() {
   useEffect(() => {
     if (localVideoRef.current && activeLocalStream) {
       localVideoRef.current.srcObject = activeLocalStream;
-      localVideoRef.current.play().catch((err) => console.log("Play hatası:", err));
+      localVideoRef.current.play().catch(() => {});
     }
   }, [activeLocalStream, isScreenSharing, isVideoOn]);
 
@@ -304,56 +474,9 @@ export default function DiscordVoiceApp() {
     } catch (e) {}
   };
 
-  // ==================== YARDIMCILAR ====================
-  // Yayında olan video track'i (öncelik: ekran paylaşımı > kamera)
-  const getOutgoingVideoTrack = () => {
-    if (isScreenSharingRef.current && screenStreamRef.current) {
-      return screenStreamRef.current.getVideoTracks()[0] || null;
-    }
-    if (isVideoOnRef.current && cameraStreamRef.current) {
-      return cameraStreamRef.current.getVideoTracks()[0] || null;
-    }
-    return null;
-  };
-
-  const createPeerConnection = (userId) => {
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    });
-
-    peerConnections.current[userId] = pc;
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socket.emit('ice-candidate', { target: userId, candidate: event.candidate });
-      }
-    };
-
-    pc.ontrack = (event) => {
-      const remoteStream = event.streams[0];
-      console.log(`[WebRTC] Track geldi - peer: ${userId}, tür: ${event.track.kind}`);
-      
-      setPeers((prev) => {
-        const existing = prev.find((p) => p.id === userId);
-        if (existing) {
-          return prev.map(p => p.id === userId ? { ...p, stream: remoteStream } : p);
-        }
-        return [...prev, { id: userId, stream: remoteStream }];
-      });
-    };
-
-    pc.onconnectionstatechange = () => {
-      console.log(`[WebRTC] Peer ${userId} bağlantı durumu: ${pc.connectionState}`);
-    };
-
-    return pc;
-  };
-
   // ==================== ARAMA KONTROLLERİ ====================
   const startCall = async (channelId) => {
+    if (inCallRef.current) return; // zaten aramadayız
     try {
       setActiveChannel(channelId);
       playSfx('join');
@@ -377,7 +500,6 @@ export default function DiscordVoiceApp() {
   const endCall = () => {
     playSfx('leave');
 
-    // AudioContext'i kapat
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
@@ -397,6 +519,11 @@ export default function DiscordVoiceApp() {
     }
     Object.values(peerConnections.current).forEach((pc) => pc.close());
     peerConnections.current = {};
+    politeFlags.current = {};
+    makingOffer.current = {};
+    ignoreOffer.current = {};
+    pendingCandidates.current = {};
+    
     setPeers([]);
     setInCall(false);
     setIsVideoOn(false);
@@ -432,14 +559,12 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // Kamera aç/kapat
+  // ✅ KAMERA AÇ/KAPAT — düzgün replaceTrack ve renegotiation
   const toggleVideo = async () => {
     if (!localStreamRef.current) return;
 
     if (!isVideoOn) {
-      if (isScreenSharingRef.current) {
-        stopScreenShare();
-      }
+      if (isScreenSharingRef.current) stopScreenShare();
 
       try {
         const camStream = await navigator.mediaDevices.getUserMedia({
@@ -448,30 +573,30 @@ export default function DiscordVoiceApp() {
         cameraStreamRef.current = camStream;
         const videoTrack = camStream.getVideoTracks()[0];
 
-        let addedCount = 0;
-        Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
+        // Peer'lere video gönder
+        for (const [peerId, pc] of Object.entries(peerConnections.current)) {
           const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video');
           if (videoSender) {
-            videoSender.replaceTrack(videoTrack);
+            await videoSender.replaceTrack(videoTrack);
           } else {
-            pc.addTrack(videoTrack, localStreamRef.current);
-            addedCount++;
-          }
-        });
-
-        if (addedCount > 0) {
-          Object.entries(peerConnections.current).forEach(async ([peerId, pc]) => {
-            try {
-              const offer = await pc.createOffer();
-              await pc.setLocalDescription(offer);
-              socket.emit('offer', { target: peerId, signal: offer });
-            } catch (e) {
-              console.error('Renegotiation hatası:', e);
+            // Transceiver var mı bak (senders'ta track null olabilir)
+            const videoTransceiver = pc.getTransceivers().find(
+              (t) => t.receiver.track?.kind === 'video' || 
+                     (t.sender?.track?.kind === 'video')
+            );
+            if (videoTransceiver) {
+              await videoTransceiver.sender.replaceTrack(videoTrack);
+            } else {
+              pc.addTrack(videoTrack, localStreamRef.current);
+              // ✅ Negotiation gerekli
+              setTimeout(() => {
+                if (peerConnections.current[peerId]) sendOffer(peerId);
+              }, 100);
             }
-          });
+          }
         }
 
-        setActiveLocalStream(localStreamRef.current);
+        rebuildLocalStream();
         setIsVideoOn(true);
 
         videoTrack.onended = () => {
@@ -485,13 +610,13 @@ export default function DiscordVoiceApp() {
       if (videoTrack) videoTrack.stop();
       cameraStreamRef.current = null;
 
-      Object.values(peerConnections.current).forEach((pc) => {
+      for (const pc of Object.values(peerConnections.current)) {
         const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-        if (sender) sender.replaceTrack(null);
-      });
+        if (sender) await sender.replaceTrack(null);
+      }
 
       setIsVideoOn(false);
-      setActiveLocalStream(localStreamRef.current);
+      rebuildLocalStream();
     }
   };
 
@@ -517,27 +642,23 @@ export default function DiscordVoiceApp() {
         screenStreamRef.current = screenStream;
         const screenTrack = screenStream.getVideoTracks()[0];
 
-        let addedCount = 0;
-        Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
+        for (const [peerId, pc] of Object.entries(peerConnections.current)) {
           const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
           if (sender) {
-            sender.replaceTrack(screenTrack);
+            await sender.replaceTrack(screenTrack);
           } else {
-            pc.addTrack(screenTrack, screenStream);
-            addedCount++;
-          }
-        });
-
-        if (addedCount > 0) {
-          Object.entries(peerConnections.current).forEach(async ([peerId, pc]) => {
-            try {
-              const offer = await pc.createOffer();
-              await pc.setLocalDescription(offer);
-              socket.emit('offer', { target: peerId, signal: offer });
-            } catch (e) {
-              console.error('Renegotiation hatası:', e);
+            const videoTransceiver = pc.getTransceivers().find(
+              (t) => t.receiver.track?.kind === 'video'
+            );
+            if (videoTransceiver) {
+              await videoTransceiver.sender.replaceTrack(screenTrack);
+            } else {
+              pc.addTrack(screenTrack, screenStream);
+              setTimeout(() => {
+                if (peerConnections.current[peerId]) sendOffer(peerId);
+              }, 100);
             }
-          });
+          }
         }
 
         setIsScreenSharing(true);
@@ -572,7 +693,11 @@ export default function DiscordVoiceApp() {
   const sendMessage = (e) => {
     e.preventDefault();
     if (!newMessage.trim()) return;
-    const msgData = { user: 'Cem Dev', text: newMessage, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
+    const msgData = { 
+      user: 'Cem Dev', 
+      text: newMessage, 
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
+    };
     socket.emit('chat-message', msgData);
     setMessages((prev) => [...prev, msgData]);
     setNewMessage('');
@@ -594,8 +719,9 @@ export default function DiscordVoiceApp() {
 
   const activePeerWithVideo = peers.find((p) => {
     if (!p.stream) return false;
-    const videoTracks = p.stream.getVideoTracks();
-    return videoTracks.some((track) => track.readyState === 'live' && !track.muted);
+    return p.stream.getVideoTracks().some(
+      (track) => track.readyState === 'live' && !track.muted
+    );
   });
 
   const isLocalBroadcasting = isVideoOn || isScreenSharing;
@@ -605,7 +731,6 @@ export default function DiscordVoiceApp() {
   return (
     <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none">
       
-      {/* Sol İkon Barı */}
       <div className="w-[72px] bg-[#1e1f22] flex flex-col items-center py-3 gap-3 shrink-0 z-30">
         <div className="w-12 h-12 bg-[#5865f2] hover:bg-[#4752c4] rounded-[24px] hover:rounded-[16px] transition-all duration-200 flex items-center justify-center text-white cursor-pointer shadow-lg">
           <Sparkles size={24} />
@@ -616,7 +741,6 @@ export default function DiscordVoiceApp() {
         </div>
       </div>
 
-      {/* Kanal Paneli */}
       <div className="w-60 bg-[#2b2d31] flex flex-col border-r border-[#1f2023] shrink-0 z-20">
         <div className="h-12 border-b border-[#1f2023] flex items-center justify-between px-4 font-bold text-white shadow-sm shrink-0">
           <span>Stuck Voice Hub</span>
@@ -649,7 +773,6 @@ export default function DiscordVoiceApp() {
           })}
         </div>
 
-        {/* Profil Barı */}
         <div className="h-14 bg-[#232428] px-3 flex items-center justify-between shrink-0 border-t border-[#1f2023]">
           <div className="flex items-center gap-2">
             <div className={`w-8 h-8 rounded-full bg-[#5865f2] flex items-center justify-center text-white font-bold text-xs transition-all ${isSpeaking ? 'ring-2 ring-[#23a55a]' : ''}`}>
@@ -669,10 +792,8 @@ export default function DiscordVoiceApp() {
         </div>
       </div>
 
-      {/* Ana Sahne */}
       <div className="flex-1 flex flex-col bg-[#313338] relative min-w-0">
         
-        {/* Üst Bar */}
         <div className="h-12 border-b border-[#1f2023] flex items-center justify-between px-4 font-bold text-white bg-[#313338] shadow-sm shrink-0">
           <div className="flex items-center gap-2">
             <Hash size={20} className="text-[#80848e]" />
@@ -714,7 +835,6 @@ export default function DiscordVoiceApp() {
           </div>
         </div>
 
-        {/* Ana İçerik */}
         <div className="flex-1 flex min-h-0 relative overflow-hidden">
           
           <div className="flex-1 p-3 flex gap-3 min-h-0 relative overflow-hidden items-center justify-center">
@@ -887,7 +1007,6 @@ export default function DiscordVoiceApp() {
 
         </div>
 
-        {/* Alt Yüzen Kontrol Paneli */}
         {inCall && (
           <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-[#1e1f22]/90 backdrop-blur-md px-6 py-3 rounded-2xl border border-[#2b2d31] flex items-center gap-4 shadow-2xl z-40">
             <button 
@@ -945,13 +1064,13 @@ function MainStreamViewer({ stream, id, isDeafened }) {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = isDeafened;
-      videoRef.current.play().catch(err => console.log("Main play error:", err));
+      videoRef.current.play().catch(() => {});
     }
   }, [stream, isDeafened]);
 
   const toggleFullScreen = () => {
     if (!document.fullscreenElement) {
-      containerRef.current?.requestFullscreen().catch(err => console.error(err));
+      containerRef.current?.requestFullscreen().catch(() => {});
     } else {
       document.exitFullscreen();
     }
@@ -986,13 +1105,7 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = isDeafened;
       videoRef.current.volume = volume;
-      videoRef.current.play()
-        .then(() => {
-          const videoTracks = stream.getVideoTracks();
-          const hasLive = videoTracks.some(t => t.readyState === 'live' && !t.muted);
-          setHasActiveVideo(hasLive);
-        })
-        .catch(err => console.log("Remote play error:", err));
+      videoRef.current.play().catch(() => {});
     }
   }, [stream, isDeafened, volume]);
 
