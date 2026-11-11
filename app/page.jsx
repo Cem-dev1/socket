@@ -23,6 +23,22 @@ const CHANNELS = [
   { id: 'tech-talk', name: 'Tech & Architecture' },
 ];
 
+// Güçlendirilmiş ses işleme kısıtları
+const AUDIO_CONSTRAINTS = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  sampleRate: 48000,
+  channelCount: 1,
+};
+
+const VIDEO_CONSTRAINTS = {
+  width: { ideal: 1280, max: 1920 },
+  height: { ideal: 720, max: 1080 },
+  frameRate: { ideal: 30, max: 60 },
+  facingMode: 'user',
+};
+
 export default function DiscordVoiceApp() {
   const [activeChannel, setActiveChannel] = useState('genel-oda');
   const [inCall, setInCall] = useState(false);
@@ -52,6 +68,7 @@ export default function DiscordVoiceApp() {
   const screenStreamRef = useRef(null);
   const cameraStreamRef = useRef(null);
   const audioContextRef = useRef(null);
+  const speakingContextRef = useRef(null);
   const analyserRef = useRef(null);
   const chatBottomRef = useRef(null);
 
@@ -62,6 +79,45 @@ export default function DiscordVoiceApp() {
   useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
 
+  // ==================== SES İŞLEME ====================
+  const applyAudioProcessing = async (rawStream) => {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.resume();
+    audioContextRef.current = audioCtx; // referansı tut
+
+    const source = audioCtx.createMediaStreamSource(rawStream);
+
+    // High-pass: fan, klavye, uğultu gibi düşük frekansları keser
+    const highpass = audioCtx.createBiquadFilter();
+    highpass.type = 'highpass';
+    highpass.frequency.value = 85;
+    highpass.Q.value = 0.7;
+
+    // Low-pass: tıslama, sibilance gibi yüksek frekansları keser
+    const lowpass = audioCtx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 8000;
+
+    // Compressor: ani yüksek sesleri (bağırma, çarpma) dengeler
+    const compressor = audioCtx.createDynamicsCompressor();
+    compressor.threshold.value = -50;
+    compressor.knee.value = 40;
+    compressor.ratio.value = 12;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.25;
+
+    const destination = audioCtx.createMediaStreamDestination();
+
+    source.connect(highpass);
+    highpass.connect(lowpass);
+    lowpass.connect(compressor);
+    compressor.connect(destination);
+
+    // İşlenmiş stream'i döndür
+    return destination.stream;
+  };
+
+  // ==================== SOCKET & WEBRTC ====================
   useEffect(() => {
     socket = io(SOCKET_URL, {
       transports: ['polling', 'websocket']
@@ -81,11 +137,9 @@ export default function DiscordVoiceApp() {
 
       const pc = createPeerConnection(userId);
       if (localStreamRef.current) {
-        // Sadece ses track'lerini ekle — video yoksa video gönderme
         const audioTracks = localStreamRef.current.getAudioTracks();
         audioTracks.forEach((track) => pc.addTrack(track, localStreamRef.current));
 
-        // Eğer aktif bir video (kamera veya ekran) varsa onu da ekle
         const outgoingVideoTrack = getOutgoingVideoTrack();
         if (outgoingVideoTrack) {
           pc.addTrack(outgoingVideoTrack, localStreamRef.current);
@@ -165,10 +219,12 @@ export default function DiscordVoiceApp() {
     };
   }, []);
 
+  // ==================== CHAT SCROLL ====================
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, showChat]);
 
+  // ==================== KONUŞMA GÖSTERGESİ ====================
   useEffect(() => {
     if (!activeLocalStream || isMuted || isDeafened) {
       setIsSpeaking(false);
@@ -177,8 +233,8 @@ export default function DiscordVoiceApp() {
 
     try {
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      audioContextRef.current = audioCtx;
-      
+      speakingContextRef.current = audioCtx;
+
       const analyser = audioCtx.createAnalyser();
       analyserRef.current = analyser;
       analyser.fftSize = 512;
@@ -209,12 +265,14 @@ export default function DiscordVoiceApp() {
         if (audioCtx && audioCtx.state !== 'closed') {
           audioCtx.close();
         }
+        speakingContextRef.current = null;
       };
     } catch (e) {
       console.error("Audio API hatası:", e);
     }
   }, [activeLocalStream, isMuted, isDeafened]);
 
+  // ==================== YEREL VİDEO ÖNİZLEME ====================
   useEffect(() => {
     if (localVideoRef.current && activeLocalStream) {
       localVideoRef.current.srcObject = activeLocalStream;
@@ -222,6 +280,7 @@ export default function DiscordVoiceApp() {
     }
   }, [activeLocalStream, isScreenSharing, isVideoOn]);
 
+  // ==================== SES EFEKTLERİ ====================
   const playSfx = (type) => {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -245,6 +304,7 @@ export default function DiscordVoiceApp() {
     } catch (e) {}
   };
 
+  // ==================== YARDIMCILAR ====================
   // Yayında olan video track'i (öncelik: ekran paylaşımı > kamera)
   const getOutgoingVideoTrack = () => {
     if (isScreenSharingRef.current && screenStreamRef.current) {
@@ -258,7 +318,10 @@ export default function DiscordVoiceApp() {
 
   const createPeerConnection = (userId) => {
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ],
     });
 
     peerConnections.current[userId] = pc;
@@ -270,36 +333,39 @@ export default function DiscordVoiceApp() {
     };
 
     pc.ontrack = (event) => {
+      const remoteStream = event.streams[0];
+      console.log(`[WebRTC] Track geldi - peer: ${userId}, tür: ${event.track.kind}`);
+      
       setPeers((prev) => {
         const existing = prev.find((p) => p.id === userId);
         if (existing) {
-          return prev.map(p => p.id === userId ? { ...p, stream: event.streams[0] } : p);
+          return prev.map(p => p.id === userId ? { ...p, stream: remoteStream } : p);
         }
-        return [...prev, { id: userId, stream: event.streams[0] }];
+        return [...prev, { id: userId, stream: remoteStream }];
       });
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log(`[WebRTC] Peer ${userId} bağlantı durumu: ${pc.connectionState}`);
     };
 
     return pc;
   };
 
+  // ==================== ARAMA KONTROLLERİ ====================
   const startCall = async (channelId) => {
     try {
       setActiveChannel(channelId);
       playSfx('join');
-      
-      // SADECE SES AL - video track hiç oluşturulmasın
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 48000
-        }, 
-        video: false
-      });
 
-      localStreamRef.current = stream;
-      setActiveLocalStream(stream);
+      const rawStream = await navigator.mediaDevices.getUserMedia({
+        audio: AUDIO_CONSTRAINTS,
+        video: false,
+      });
+      const processedStream = await applyAudioProcessing(rawStream);
+
+      localStreamRef.current = processedStream;
+      setActiveLocalStream(processedStream);
       setInCall(true);
       socket.emit('join-room', channelId);
       socket.emit('update-seat', { seat: localSeat });
@@ -310,6 +376,13 @@ export default function DiscordVoiceApp() {
 
   const endCall = () => {
     playSfx('leave');
+
+    // AudioContext'i kapat
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
@@ -359,34 +432,45 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // Kamera aç/kapat — track'i sadece açıkken peer'lere gönder
+  // Kamera aç/kapat
   const toggleVideo = async () => {
     if (!localStreamRef.current) return;
 
     if (!isVideoOn) {
-      // Ekran paylaşımı açıksa önce onu kapat
       if (isScreenSharingRef.current) {
         stopScreenShare();
       }
 
       try {
         const camStream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+          video: VIDEO_CONSTRAINTS,
         });
         cameraStreamRef.current = camStream;
         const videoTrack = camStream.getVideoTracks()[0];
 
-        // Peer'lere video gönder
-        Object.values(peerConnections.current).forEach((pc) => {
-          const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-          if (sender) {
-            sender.replaceTrack(videoTrack);
+        let addedCount = 0;
+        Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
+          const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video');
+          if (videoSender) {
+            videoSender.replaceTrack(videoTrack);
           } else {
             pc.addTrack(videoTrack, localStreamRef.current);
+            addedCount++;
           }
         });
 
-        // Yerel önizleme için activeLocalStream'i güncelle (ses + video birleşik)
+        if (addedCount > 0) {
+          Object.entries(peerConnections.current).forEach(async ([peerId, pc]) => {
+            try {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              socket.emit('offer', { target: peerId, signal: offer });
+            } catch (e) {
+              console.error('Renegotiation hatası:', e);
+            }
+          });
+        }
+
         setActiveLocalStream(localStreamRef.current);
         setIsVideoOn(true);
 
@@ -397,7 +481,6 @@ export default function DiscordVoiceApp() {
         console.error('Kamera açılamadı:', e);
       }
     } else {
-      // Kamerayı kapat — track'i tamamen kaldır
       const videoTrack = cameraStreamRef.current?.getVideoTracks()[0];
       if (videoTrack) videoTrack.stop();
       cameraStreamRef.current = null;
@@ -414,7 +497,6 @@ export default function DiscordVoiceApp() {
 
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
-      // Kamera açıksa önce kapat
       if (isVideoOnRef.current) {
         const camTrack = cameraStreamRef.current?.getVideoTracks()[0];
         if (camTrack) camTrack.stop();
@@ -427,22 +509,36 @@ export default function DiscordVoiceApp() {
           video: {
             frameRate: { ideal: 60, max: 60 },
             width: { ideal: 1920, max: 3840 },
-            height: { ideal: 1080, max: 2160 }
+            height: { ideal: 1080, max: 2160 },
           },
-          audio: true
+          audio: true,
         });
 
         screenStreamRef.current = screenStream;
         const screenTrack = screenStream.getVideoTracks()[0];
 
-        Object.values(peerConnections.current).forEach((pc) => {
+        let addedCount = 0;
+        Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
           const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
           if (sender) {
             sender.replaceTrack(screenTrack);
           } else {
             pc.addTrack(screenTrack, screenStream);
+            addedCount++;
           }
         });
+
+        if (addedCount > 0) {
+          Object.entries(peerConnections.current).forEach(async ([peerId, pc]) => {
+            try {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              socket.emit('offer', { target: peerId, signal: offer });
+            } catch (e) {
+              console.error('Renegotiation hatası:', e);
+            }
+          });
+        }
 
         setIsScreenSharing(true);
         setActiveLocalStream(screenStream);
@@ -465,7 +561,6 @@ export default function DiscordVoiceApp() {
     }
     setIsScreenSharing(false);
 
-    // Peer'lerdeki video sender'ı null yap — video gönderme
     Object.values(peerConnections.current).forEach((pc) => {
       const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
       if (sender) sender.replaceTrack(null);
@@ -487,29 +582,26 @@ export default function DiscordVoiceApp() {
     setUserVolumes((prev) => ({ ...prev, [peerId]: vol }));
   };
 
+  // ==================== YERLEŞİM ====================
   const seatCoordinates = [
     { x: 0, y: -120, pan: 0 },
     { x: 110, y: -60, pan: 0.6 },
     { x: 110, y: 60, pan: 0.9 },
     { x: 0, y: 120, pan: 0 },
     { x: -110, y: 60, pan: -0.9 },
-    { x: -110, y: -60, pan: -0.6 }
+    { x: -110, y: -60, pan: -0.6 },
   ];
 
-  // Sadece gerçekten canlı ve susturulmamış video track'i olan peer'leri yayıncı kabul et
-  const activePeerWithVideo = peers.find(p => {
+  const activePeerWithVideo = peers.find((p) => {
     if (!p.stream) return false;
     const videoTracks = p.stream.getVideoTracks();
-    // Remote track'lerde `enabled` her zaman true döner — onun yerine readyState ve muted kontrolü
-    return videoTracks.some(track => track.readyState === 'live' && !track.muted);
+    return videoTracks.some((track) => track.readyState === 'live' && !track.muted);
   });
 
-  // Yerel kullanıcının gerçekten kamera veya ekran paylaşımı butonu açık mı?
   const isLocalBroadcasting = isVideoOn || isScreenSharing;
-
-  // Gerçek anlamda aktif bir yayın var mı?
   const isAnyBroadcastActive = !!activePeerWithVideo || isLocalBroadcasting;
 
+  // ==================== JSX ====================
   return (
     <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none">
       
@@ -642,10 +734,8 @@ export default function DiscordVoiceApp() {
             ) : viewMode === 'grid' ? (
               <div className="w-full h-full flex flex-col gap-3">
                 
-                {/* 1. DURUM: Biri Yayın Açtıysa -> Üstte Kocaman Ana Ekran, Altta Diğerleri Küçük Kareler */}
                 {isAnyBroadcastActive ? (
                   <>
-                    {/* BÜYÜK ANA YAYIN EKRANI */}
                     <div className="flex-1 rounded-xl bg-[#111214] border border-[#1f2023] relative overflow-hidden flex items-center justify-center shadow-2xl">
                       {activePeerWithVideo ? (
                         <MainStreamViewer stream={activePeerWithVideo.stream} id={activePeerWithVideo.id} isDeafened={isDeafened} />
@@ -659,9 +749,7 @@ export default function DiscordVoiceApp() {
                       )}
                     </div>
 
-                    {/* ALT KÜÇÜK KARELER (DİĞER KATILIMCILAR VEYA SEN) */}
                     <div className="h-36 w-full flex gap-3 overflow-x-auto shrink-0 pb-1">
-                      {/* Eğer karşı taraf yayın açtıysa, sen altta küçük kutuda görün */}
                       {activePeerWithVideo && (
                         <div className="relative flex flex-col items-center justify-center rounded-xl bg-[#111214] border border-[#1f2023] h-full aspect-video overflow-hidden shrink-0">
                           <video 
@@ -681,7 +769,6 @@ export default function DiscordVoiceApp() {
                         </div>
                       )}
 
-                      {/* Diğer odadaki kişiler */}
                       {peers.filter(p => !activePeerWithVideo || p.id !== activePeerWithVideo.id).map((peer) => (
                         <div key={peer.id} className="h-full aspect-video shrink-0">
                           <RemoteUserCard 
@@ -696,7 +783,6 @@ export default function DiscordVoiceApp() {
                     </div>
                   </>
                 ) : (
-                  /* 2. DURUM: Kimsede Yayın Yoksa -> Herkes Eşit Karelerde Grid Yerleşimi (Sen Ortada/Yanda, Diğerleri Yanında) */
                   <div className="w-full h-full grid grid-cols-1 md:grid-cols-2 p-4 gap-4 items-center justify-center overflow-y-auto">
                     <div className="relative flex flex-col items-center justify-center rounded-xl bg-[#1e1f22] border border-[#2b2d31] w-full h-full aspect-video shadow-lg">
                       <div className={`w-20 h-20 rounded-full bg-[#5865f2] flex items-center justify-center text-white font-bold text-2xl shadow-xl transition-all ${isSpeaking ? 'ring-4 ring-[#23a55a]' : ''}`}>
@@ -760,7 +846,6 @@ export default function DiscordVoiceApp() {
             )}
           </div>
 
-          {/* Metin Sohbeti Yan Paneli */}
           {inCall && showChat && (
             <div className="w-80 bg-[#313338] border-l border-[#1f2023] flex flex-col shrink-0 z-20">
               <div className="h-10 border-b border-[#1f2023] px-3 flex items-center text-xs font-bold text-white shadow-sm">
@@ -850,7 +935,8 @@ export default function DiscordVoiceApp() {
   );
 }
 
-// Tam ekran yapılabilen büyük yayın görüntüleyici
+// ==================== ALT BİLEŞENLER ====================
+
 function MainStreamViewer({ stream, id, isDeafened }) {
   const videoRef = useRef(null);
   const containerRef = useRef(null);
@@ -902,7 +988,6 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
       videoRef.current.volume = volume;
       videoRef.current.play()
         .then(() => {
-          // Remote track'lerde `enabled` her zaman true döner — readyState ve muted kontrolü yap
           const videoTracks = stream.getVideoTracks();
           const hasLive = videoTracks.some(t => t.readyState === 'live' && !t.muted);
           setHasActiveVideo(hasLive);
@@ -911,7 +996,6 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
     }
   }, [stream, isDeafened, volume]);
 
-  // Stream'deki canlı video track'lerini izle
   useEffect(() => {
     if (!stream) {
       setHasActiveVideo(false);
