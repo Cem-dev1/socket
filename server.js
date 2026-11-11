@@ -10,16 +10,12 @@ const port = process.env.PORT || 3000;
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
-// roomId -> Map<socketId, { seat }>
 const roomMembers = new Map();
 
-// ✅ Tüm odaların kullanıcı listesini yayınla
 const broadcastRoomList = (io) => {
   const list = {};
   for (const [roomId, members] of roomMembers.entries()) {
-    if (members.size > 0) {
-      list[roomId] = Array.from(members.keys());
-    }
+    if (members.size > 0) list[roomId] = Array.from(members.keys());
   }
   io.emit('room-list', list);
 };
@@ -47,7 +43,6 @@ app.prepare().then(() => {
 
     let currentRoom = null;
 
-    // ✅ Bağlanınca mevcut oda listesini gönder
     const initialList = {};
     for (const [roomId, members] of roomMembers.entries()) {
       if (members.size > 0) initialList[roomId] = Array.from(members.keys());
@@ -88,8 +83,6 @@ app.prepare().then(() => {
       socket.to(roomId).emit('user-connected', socket.id);
 
       members.set(socket.id, { seat: 0 });
-
-      // ✅ Tüm client'lara güncel oda listesini gönder
       broadcastRoomList(io);
     });
 
@@ -125,9 +118,7 @@ app.prepare().then(() => {
     socket.on('update-seat', (data) => {
       if (currentRoom) {
         const members = roomMembers.get(currentRoom);
-        if (members && members.has(socket.id)) {
-          members.get(socket.id).seat = data.seat;
-        }
+        if (members && members.has(socket.id)) members.get(socket.id).seat = data.seat;
         socket.to(currentRoom).emit('seat-update', { userId: socket.id, seat: data.seat });
       }
     });
