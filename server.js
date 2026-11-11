@@ -13,6 +13,17 @@ const handle = app.getRequestHandler();
 // roomId -> Map<socketId, { seat }>
 const roomMembers = new Map();
 
+// ✅ Tüm odaların kullanıcı listesini yayınla
+const broadcastRoomList = (io) => {
+  const list = {};
+  for (const [roomId, members] of roomMembers.entries()) {
+    if (members.size > 0) {
+      list[roomId] = Array.from(members.keys());
+    }
+  }
+  io.emit('room-list', list);
+};
+
 app.prepare().then(() => {
   const server = createServer(async (req, res) => {
     try {
@@ -36,10 +47,16 @@ app.prepare().then(() => {
 
     let currentRoom = null;
 
+    // ✅ Bağlanınca mevcut oda listesini gönder
+    const initialList = {};
+    for (const [roomId, members] of roomMembers.entries()) {
+      if (members.size > 0) initialList[roomId] = Array.from(members.keys());
+    }
+    socket.emit('room-list', initialList);
+
     socket.on('join-room', (roomId) => {
       console.log(`[join-room] ${socket.id} → ${roomId}`);
 
-      // Aynı odadaysa tekrar işlem yapma
       if (currentRoom === roomId) {
         socket.emit('existing-members', {
           members: Array.from(roomMembers.get(roomId)?.keys() || []).filter(id => id !== socket.id),
@@ -47,7 +64,6 @@ app.prepare().then(() => {
         return;
       }
 
-      // Eski odadan çık
       if (currentRoom) {
         socket.leave(currentRoom);
         const oldMembers = roomMembers.get(currentRoom);
@@ -56,6 +72,7 @@ app.prepare().then(() => {
           if (oldMembers.size === 0) roomMembers.delete(currentRoom);
         }
         socket.to(currentRoom).emit('user-disconnected', socket.id);
+        currentRoom = null;
       }
 
       currentRoom = roomId;
@@ -64,26 +81,43 @@ app.prepare().then(() => {
       if (!roomMembers.has(roomId)) roomMembers.set(roomId, new Map());
       const members = roomMembers.get(roomId);
 
-      // Mevcut üyeleri yeni gelen kişiye gönder
       const existingMembers = Array.from(members.keys()).filter(id => id !== socket.id);
       console.log(`[join-room] ${socket.id} için mevcut:`, existingMembers);
       socket.emit('existing-members', { members: existingMembers });
 
-      // Diğerlerine yeni geleni bildir
       socket.to(roomId).emit('user-connected', socket.id);
 
       members.set(socket.id, { seat: 0 });
-      console.log(`[Oda ${roomId}] üye: ${members.size}`);
+
+      // ✅ Tüm client'lara güncel oda listesini gönder
+      broadcastRoomList(io);
+    });
+
+    socket.on('leave-room', () => {
+      if (currentRoom) {
+        const room = currentRoom;
+        socket.leave(room);
+        const members = roomMembers.get(room);
+        if (members) {
+          members.delete(socket.id);
+          if (members.size === 0) roomMembers.delete(room);
+        }
+        socket.to(room).emit('user-disconnected', socket.id);
+        currentRoom = null;
+        broadcastRoomList(io);
+      }
     });
 
     socket.on('disconnect', () => {
       if (currentRoom) {
-        const members = roomMembers.get(currentRoom);
+        const room = currentRoom;
+        const members = roomMembers.get(room);
         if (members) {
           members.delete(socket.id);
-          if (members.size === 0) roomMembers.delete(currentRoom);
+          if (members.size === 0) roomMembers.delete(room);
         }
-        socket.to(currentRoom).emit('user-disconnected', socket.id);
+        socket.to(room).emit('user-disconnected', socket.id);
+        broadcastRoomList(io);
       }
       console.log('❌ Ayrıldı:', socket.id);
     });

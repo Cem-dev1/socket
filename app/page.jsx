@@ -59,8 +59,9 @@ export default function DiscordVoiceApp() {
   const [peerSeats, setPeerSeats] = useState({});
 
   const [peers, setPeers] = useState([]);
-  // Kanal bazlı kullanıcı listesi: { channelId: [socketId, ...] }
-  const [channelUsers, setChannelUsers] = useState({});
+  // ✅ Tüm odalardaki kullanıcılar: { roomId: [socketId, ...] }
+  const [roomList, setRoomList] = useState({});
+  const [myId, setMyId] = useState(null);
 
   // Refs
   const socketRef = useRef(null);
@@ -77,10 +78,8 @@ export default function DiscordVoiceApp() {
   const isVideoOnRef = useRef(false);
   const isScreenSharingRef = useRef(false);
   const inCallRef = useRef(false);
-  const activeChannelRef = useRef('genel-oda');
-  const mySocketIdRef = useRef(null);
 
-  // Perfect negotiation state
+  // Perfect negotiation
   const politeFlags = useRef({});
   const makingOffer = useRef({});
   const ignoreOffer = useRef({});
@@ -89,7 +88,6 @@ export default function DiscordVoiceApp() {
   useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
   useEffect(() => { inCallRef.current = inCall; }, [inCall]);
-  useEffect(() => { activeChannelRef.current = activeChannel; }, [activeChannel]);
 
   // ==================== SES İŞLEME ====================
   const applyAudioProcessing = async (rawStream) => {
@@ -195,6 +193,7 @@ export default function DiscordVoiceApp() {
       });
     }
 
+    // ✅ Video transceiver'ı sendrecv olarak ekle
     pc.addTransceiver('video', { direction: 'sendrecv' });
 
     const activeVideo = getOutgoingVideoTrack();
@@ -232,6 +231,21 @@ export default function DiscordVoiceApp() {
     }
   };
 
+  // ✅ Video açılınca aktif video track'ini tüm peer'lere gönder + renegotiation
+  const broadcastVideoTrack = async (videoTrack) => {
+    for (const [peerId, pc] of Object.entries(peerConnections.current)) {
+      const transceiver = findVideoTransceiver(pc);
+      if (transceiver?.sender) {
+        try {
+          await transceiver.sender.replaceTrack(videoTrack);
+          console.log(`[Video] ${peerId} replaceTrack OK`);
+        } catch (e) {
+          console.error(`[Video] ${peerId} replaceTrack hata:`, e);
+        }
+      }
+    }
+  };
+
   // ==================== SOCKET ====================
   useEffect(() => {
     if (socketRef.current) return;
@@ -245,12 +259,18 @@ export default function DiscordVoiceApp() {
     socketRef.current = newSocket;
 
     newSocket.on('connect', () => {
-      mySocketIdRef.current = newSocket.id;
+      setMyId(newSocket.id);
       console.log('✅ Socket bağlandı:', newSocket.id);
     });
 
     newSocket.on('connect_error', (err) => {
       console.error('❌ Socket hatası:', err.message);
+    });
+
+    // ✅ Tüm odalardaki kullanıcı listesi güncellendiğinde
+    newSocket.on('room-list', (list) => {
+      console.log('📋 Oda listesi güncellendi:', list);
+      setRoomList(list || {});
     });
 
     newSocket.on('existing-members', async ({ members }) => {
@@ -412,30 +432,6 @@ export default function DiscordVoiceApp() {
     };
   }, []);
 
-  // ==================== KANAL KULLANICI LİSTESİ TAKİBİ ====================
-  // inCall + activeChannel + peers + kendi id üzerinden güncelle
-  useEffect(() => {
-    if (!inCall) {
-      // Aramada değilsek sadece kendi kanalımızdaki diğerleri dursun
-      setChannelUsers((prev) => {
-        const next = { ...prev };
-        delete next[activeChannel];
-        return next;
-      });
-      return;
-    }
-
-    const myId = mySocketIdRef.current || socketRef.current?.id;
-    const userList = [];
-    if (myId) userList.push(myId);
-    peers.forEach(p => userList.push(p.id));
-
-    setChannelUsers((prev) => ({
-      ...prev,
-      [activeChannel]: userList,
-    }));
-  }, [inCall, activeChannel, peers]);
-
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, showChat]);
@@ -562,6 +558,10 @@ export default function DiscordVoiceApp() {
     inCallRef.current = false;
     playSfx('leave');
 
+    if (socketRef.current) {
+      socketRef.current.emit('leave-room');
+    }
+
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
@@ -587,7 +587,6 @@ export default function DiscordVoiceApp() {
     pendingCandidates.current = {};
 
     setPeers([]);
-    setChannelUsers({});
     setInCall(false);
     setIsVideoOn(false);
     setIsScreenSharing(false);
@@ -634,17 +633,8 @@ export default function DiscordVoiceApp() {
         cameraStreamRef.current = camStream;
         const videoTrack = camStream.getVideoTracks()[0];
 
-        for (const [peerId, pc] of Object.entries(peerConnections.current)) {
-          const transceiver = findVideoTransceiver(pc);
-          if (transceiver?.sender) {
-            await transceiver.sender.replaceTrack(videoTrack);
-          } else {
-            pc.addTransceiver(videoTrack, { direction: 'sendrecv', streams: [localStreamRef.current] });
-            setTimeout(() => {
-              if (peerConnections.current[peerId]) sendOffer(peerId);
-            }, 100);
-          }
-        }
+        // ✅ Tüm peer'lere video track'ini gönder
+        await broadcastVideoTrack(videoTrack);
 
         const combinedStream = new MediaStream([
           ...localStreamRef.current.getAudioTracks(),
@@ -699,17 +689,7 @@ export default function DiscordVoiceApp() {
         screenStreamRef.current = screenStream;
         const screenTrack = screenStream.getVideoTracks()[0];
 
-        for (const [peerId, pc] of Object.entries(peerConnections.current)) {
-          const transceiver = findVideoTransceiver(pc);
-          if (transceiver?.sender) {
-            await transceiver.sender.replaceTrack(screenTrack);
-          } else {
-            pc.addTransceiver(screenTrack, { direction: 'sendrecv', streams: [screenStream] });
-            setTimeout(() => {
-              if (peerConnections.current[peerId]) sendOffer(peerId);
-            }, 100);
-          }
-        }
+        await broadcastVideoTrack(screenTrack);
 
         setIsScreenSharing(true);
 
@@ -784,14 +764,12 @@ export default function DiscordVoiceApp() {
   const isLocalBroadcasting = isVideoOn || isScreenSharing;
   const isAnyBroadcastActive = !!activePeerWithVideo || isLocalBroadcasting;
 
-  // Kanal altındaki kullanıcı listesi için helper
+  // ✅ Kanal bazlı kullanıcı listesi (kendi odamızı da birleştir)
   const getChannelUsers = (channelId) => {
-    if (inCall && activeChannel === channelId) {
-      const myId = mySocketIdRef.current || socketRef.current?.id || 'me';
-      const list = [myId, ...peers.map(p => p.id)];
-      return list;
-    }
-    return channelUsers[channelId] || [];
+    const fromServer = roomList[channelId] || [];
+    const merged = new Set(fromServer);
+    if (myId) merged.add(myId); // Kendimizi her zaman göster
+    return Array.from(merged);
   };
 
   // ==================== JSX ====================
@@ -843,7 +821,7 @@ export default function DiscordVoiceApp() {
                 {usersInChannel.length > 0 && (
                   <div className="ml-6 mt-0.5 space-y-0.5">
                     {usersInChannel.map((userId, idx) => {
-                      const isMe = userId === (mySocketIdRef.current || socketRef.current?.id);
+                      const isMe = userId === myId;
                       const peer = peers.find(p => p.id === userId);
                       const peerHasVideo = peer?.stream?.getVideoTracks().some(
                         t => t.readyState === 'live' && !t.muted
@@ -852,7 +830,7 @@ export default function DiscordVoiceApp() {
                       
                       return (
                         <div
-                          key={userId + idx}
+                          key={userId + '-' + idx}
                           className={`flex items-center gap-2 px-2 py-1 rounded text-xs transition-all ${
                             isMe 
                               ? 'text-[#23a55a] font-medium' 
