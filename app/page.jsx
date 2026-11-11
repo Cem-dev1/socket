@@ -38,7 +38,6 @@ const VIDEO_CONSTRAINTS = {
   facingMode: 'user',
 };
 
-// ✅ Koltuk koordinatları — mekânsal ses için 2D
 const SEAT_COORDINATES = [
   { x: 0, y: -120, pan: 0, label: '1' },
   { x: 110, y: -60, pan: 0.7, label: '2' },
@@ -49,7 +48,6 @@ const SEAT_COORDINATES = [
 ];
 
 export default function DiscordVoiceApp() {
-  // ✅ Bağlantı durumu
   const [connectionState, setConnectionState] = useState('connecting');
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [connectionWaitTime, setConnectionWaitTime] = useState(0);
@@ -65,9 +63,7 @@ export default function DiscordVoiceApp() {
   
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
-  // ✅ Chat başlangıçta KAPALI
   const [showChat, setShowChat] = useState(false);
-  // ✅ Okunmamış mesaj sayacı
   const [unreadCount, setUnreadCount] = useState(0);
 
   const [ping, setPing] = useState(14);
@@ -90,13 +86,17 @@ export default function DiscordVoiceApp() {
   const peerConnections = useRef({});
   const screenStreamRef = useRef(null);
   const cameraStreamRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const speakingContextRef = useRef(null);
+  
+  // ✅ AYRI CONTEXT'LER — çakışma yok
+  const audioContextRef = useRef(null);       // Local mic işleme
+  const speakingContextRef = useRef(null);    // Konuşma göstergesi analiz
+  const playbackContextRef = useRef(null);    // Remote ses çalma (spatial)
+  
   const analyserRef = useRef(null);
   const chatBottomRef = useRef(null);
+  const gateCleanupRef = useRef(null);        // ✅ Gate animation iptal
 
-  // ✅ Mekânsal ses için peer audio node'ları
-  const spatialAudioNodes = useRef({}); // { peerId: { source, panner, gain } }
+  const spatialAudioNodes = useRef({});
 
   const isVideoOnRef = useRef(false);
   const isScreenSharingRef = useRef(false);
@@ -105,6 +105,8 @@ export default function DiscordVoiceApp() {
   const showChatRef = useRef(false);
   const localSeatRef = useRef(0);
   const peerSeatsRef = useRef({});
+  const isMutedRef = useRef(false);
+  const isDeafenedRef = useRef(false);
 
   const politeFlags = useRef({});
   const makingOffer = useRef({});
@@ -120,8 +122,9 @@ export default function DiscordVoiceApp() {
   useEffect(() => { showChatRef.current = showChat; }, [showChat]);
   useEffect(() => { localSeatRef.current = localSeat; }, [localSeat]);
   useEffect(() => { peerSeatsRef.current = peerSeats; }, [peerSeats]);
+  useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
+  useEffect(() => { isDeafenedRef.current = isDeafened; }, [isDeafened]);
 
-  // ✅ Bağlantı bekleme sayacı
   useEffect(() => {
     if (connectionState === 'connected') {
       setConnectionWaitTime(0);
@@ -139,7 +142,6 @@ export default function DiscordVoiceApp() {
     return () => clearInterval(interval);
   }, [connectionState]);
 
-  // ✅ Sağ tık menü dışına tıklayınca kapat
   useEffect(() => {
     if (!contextMenu) return;
     const handleClick = () => setContextMenu(null);
@@ -152,41 +154,112 @@ export default function DiscordVoiceApp() {
     };
   }, [contextMenu]);
 
-  // ✅ Chat açılınca okunmamış sayacı sıfırla
   useEffect(() => {
     if (showChat && unreadCount > 0) {
       setUnreadCount(0);
     }
   }, [showChat]);
 
-  // ==================== SES İŞLEME ====================
+  // ==================== SES İŞLEME (GELİŞMİŞ GÜRÜLTÜ ENGELLEME) ====================
   const applyAudioProcessing = async (rawStream) => {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     await audioCtx.resume();
     audioContextRef.current = audioCtx;
 
     const source = audioCtx.createMediaStreamSource(rawStream);
+
+    // 1️⃣ HIGH-PASS — bas uğultu (rüzgar, fan, masa vuruntusu)
     const highpass = audioCtx.createBiquadFilter();
     highpass.type = 'highpass';
-    highpass.frequency.value = 85;
+    highpass.frequency.value = 120;
     highpass.Q.value = 0.7;
 
+    // 2️⃣ LOW-PASS — tiz tıslama (sibilance, nefes)
     const lowpass = audioCtx.createBiquadFilter();
     lowpass.type = 'lowpass';
-    lowpass.frequency.value = 8000;
+    lowpass.frequency.value = 6500;
+    lowpass.Q.value = 0.7;
 
+    // 3️⃣ PEQ — konuşma bandını güçlendir (1-3 kHz)
+    const presence = audioCtx.createBiquadFilter();
+    presence.type = 'peaking';
+    presence.frequency.value = 2000;
+    presence.Q.value = 1.0;
+    presence.gain.value = 4;
+
+    // 4️⃣ PEQ — klavye bölgesini bastır (4-6 kHz)
+    const keyboardCut = audioCtx.createBiquadFilter();
+    keyboardCut.type = 'peaking';
+    keyboardCut.frequency.value = 5000;
+    keyboardCut.Q.value = 2.0;
+    keyboardCut.gain.value = -8;
+
+    // 5️⃣ COMPRESSOR — ani sesleri bastır
     const compressor = audioCtx.createDynamicsCompressor();
-    compressor.threshold.value = -50;
-    compressor.knee.value = 40;
-    compressor.ratio.value = 12;
-    compressor.attack.value = 0.003;
+    compressor.threshold.value = -35;
+    compressor.knee.value = 10;
+    compressor.ratio.value = 20;
+    compressor.attack.value = 0.001;
     compressor.release.value = 0.25;
 
+    // 6️⃣ NOISE GATE — sessizlikte mikrofonu sustur (hysteresis)
+    const noiseGate = audioCtx.createGain();
+    noiseGate.gain.value = 1;
+
+    // ✅ AYRI analyser — speaking effect ile karışmasın
+    const gateAnalyser = audioCtx.createAnalyser();
+    gateAnalyser.fftSize = 512;
+    const gateData = new Uint8Array(gateAnalyser.frequencyBinCount);
+
+    const GATE_THRESHOLD = 25;
+    const GATE_HYSTERESIS = 0.7;   // kapanma için threshold * 0.7
+    const GATE_ATTACK = 0.05;
+    const GATE_RELEASE = 0.3;
+    
+    let isGateOpen = true;
+    let gateAnimationId;
+
+    const checkGate = () => {
+      // ✅ Context kapandıysa dur
+      if (audioCtx.state === 'closed') return;
+      
+      gateAnalyser.getByteFrequencyData(gateData);
+      let sum = 0;
+      for (let i = 0; i < gateData.length; i++) sum += gateData[i];
+      const avg = sum / gateData.length;
+
+      // ✅ Hysteresis: açılmak için yüksek, kapanmak için düşük eşik
+      if (avg > GATE_THRESHOLD && !isGateOpen) {
+        isGateOpen = true;
+        noiseGate.gain.setTargetAtTime(1, audioCtx.currentTime, GATE_ATTACK);
+      } else if (avg < GATE_THRESHOLD * GATE_HYSTERESIS && isGateOpen) {
+        isGateOpen = false;
+        noiseGate.gain.setTargetAtTime(0.05, audioCtx.currentTime, GATE_RELEASE);
+      }
+      
+      gateAnimationId = requestAnimationFrame(checkGate);
+    };
+
+    // Hat: source → highpass → lowpass → presence → keyboardCut → compressor → noiseGate → destination
     const destination = audioCtx.createMediaStreamDestination();
     source.connect(highpass);
     highpass.connect(lowpass);
-    lowpass.connect(compressor);
-    compressor.connect(destination);
+    lowpass.connect(presence);
+    presence.connect(keyboardCut);
+    keyboardCut.connect(compressor);
+    compressor.connect(noiseGate);
+    noiseGate.connect(destination);
+
+    // ✅ Gate analyser'ı compressor'dan sonra bağla (gate için)
+    compressor.connect(gateAnalyser);
+
+    checkGate();
+
+    // ✅ Cleanup kaydet
+    gateCleanupRef.current = () => {
+      cancelAnimationFrame(gateAnimationId);
+    };
+
     return destination.stream;
   };
 
@@ -201,12 +274,15 @@ export default function DiscordVoiceApp() {
     return null;
   };
 
-  // ✅ Mekânsal ses: peer stream'ini Web Audio API ile panner'a bağla
+  // ✅ Mekânsal ses — AYRI playback context ile
   const setupSpatialAudio = (peerId, stream) => {
     try {
-      if (!audioContextRef.current) return;
-      const audioCtx = audioContextRef.current;
-      if (audioCtx.state === 'closed') return;
+      // ✅ Playback için ayrı context kullan
+      if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
+        playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const audioCtx = playbackContextRef.current;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
 
       // Eski node'ları temizle
       if (spatialAudioNodes.current[peerId]) {
@@ -221,11 +297,9 @@ export default function DiscordVoiceApp() {
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length === 0) return;
 
-      // ✅ Yeni stream (sadece ses) oluştur
       const audioOnlyStream = new MediaStream(audioTracks);
       const source = audioCtx.createMediaStreamSource(audioOnlyStream);
       
-      // ✅ PannerNode — 2D mekânsal ses
       const panner = audioCtx.createPanner();
       panner.panningModel = 'HRTF';
       panner.distanceModel = 'inverse';
@@ -237,9 +311,8 @@ export default function DiscordVoiceApp() {
       panner.coneOuterGain = 0;
       panner.positionX.value = 0;
       panner.positionY.value = 0;
-      panner.positionZ.value = -1; // dinleyicinin önünde
+      panner.positionZ.value = -1;
 
-      // ✅ GainNode — kullanıcı ses seviyesi
       const gain = audioCtx.createGain();
       gain.gain.value = userVolumes[peerId] ?? 1;
 
@@ -249,47 +322,37 @@ export default function DiscordVoiceApp() {
 
       spatialAudioNodes.current[peerId] = { source, panner, gain };
 
-      // İlk konumu uygula
       updateSpatialPosition(peerId);
-
     } catch (e) {
       console.error(`[Spatial] ${peerId} setup hatası:`, e);
     }
   };
 
-  // ✅ Peer'in sesini koltuk konumuna göre panner'a yerleştir
   const updateSpatialPosition = (peerId) => {
     const nodes = spatialAudioNodes.current[peerId];
-    if (!nodes || !nodes.panner || !audioContextRef.current) return;
-    if (audioContextRef.current.state === 'closed') return;
+    if (!nodes || !nodes.panner) return;
 
     const peerSeat = peerSeatsRef.current[peerId] ?? 0;
     const mySeat = localSeatRef.current;
 
     if (peerSeat === mySeat) {
-      // Aynı koltukta — merkeze koy (nadir durum)
       nodes.panner.positionX.value = 0;
       nodes.panner.positionY.value = 0;
       nodes.panner.positionZ.value = -1;
       return;
     }
 
-    // ✅ Koltuk farkına göre pan ve mesafe hesapla
     const peerCoord = SEAT_COORDINATES[peerSeat] || SEAT_COORDINATES[0];
     const myCoord = SEAT_COORDINATES[mySeat] || SEAT_COORDINATES[0];
     
-    // Relative konum: peer - my
     const relX = peerCoord.x - myCoord.x;
     const relY = peerCoord.y - myCoord.y;
     
-    // Panner koordinatları (sağ = +X, yukarı = +Y, önde = -Z)
-    nodes.panner.positionX.value = relX / 100;      // normalize et
+    nodes.panner.positionX.value = relX / 100;
     nodes.panner.positionY.value = relY / 100;
-    nodes.panner.positionZ.value = -Math.abs(relY) / 100 - 1; // hep önde
-
+    nodes.panner.positionZ.value = -Math.abs(relY) / 100 - 1;
   };
 
-  // ✅ Peer ses seviyesini güncelle
   const updateSpatialGain = (peerId, volume) => {
     const nodes = spatialAudioNodes.current[peerId];
     if (nodes?.gain) {
@@ -299,7 +362,6 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ✅ Peer'in spatial node'larını temizle
   const cleanupSpatialAudio = (peerId) => {
     const nodes = spatialAudioNodes.current[peerId];
     if (!nodes) return;
@@ -353,7 +415,6 @@ export default function DiscordVoiceApp() {
       
       updatePeer();
 
-      // ✅ Ses track'i geldiyse mekânsal ses kur
       if (event.track.kind === 'audio') {
         setTimeout(() => setupSpatialAudio(userId, remoteStream), 100);
       }
@@ -614,7 +675,6 @@ export default function DiscordVoiceApp() {
     newSocket.on('chat-message', (msg) => {
       setMessages((prev) => [...prev, msg]);
       
-      // ✅ Chat kapalıyken bildirim sayacı arttır + ses çal
       if (!showChatRef.current) {
         setUnreadCount((prev) => prev + 1);
         playNotificationSound();
@@ -625,7 +685,6 @@ export default function DiscordVoiceApp() {
       setPeerSeats((prev) => {
         const next = { ...prev, [data.userId]: data.seat };
         peerSeatsRef.current = next;
-        // ✅ Koltuk değişince mekânsal konumu güncelle
         setTimeout(() => updateSpatialPosition(data.userId), 50);
         return next;
       });
@@ -678,7 +737,7 @@ export default function DiscordVoiceApp() {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, showChat]);
 
-  // ==================== KONUŞMA GÖSTERGESİ ====================
+  // ==================== KONUŞMA GÖSTERGESİ (AYRI CONTEXT) ====================
   useEffect(() => {
     if (!activeLocalStream || isMuted || isDeafened) {
       setIsSpeaking(false);
@@ -690,6 +749,7 @@ export default function DiscordVoiceApp() {
       return;
     }
     try {
+      // ✅ AYRI context — local mic ctx ile çakışmaz
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       speakingContextRef.current = audioCtx;
       const analyser = audioCtx.createAnalyser();
@@ -701,18 +761,19 @@ export default function DiscordVoiceApp() {
       const dataArray = new Uint8Array(bufferLength);
       let animationId;
       const checkAudioLevel = () => {
-        if (!analyserRef.current) return;
+        if (audioCtx.state === 'closed') return;
         analyserRef.current.getByteFrequencyData(dataArray);
         let sum = 0;
         for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
-        setIsSpeaking(sum / bufferLength > 12);
+        setIsSpeaking(sum / bufferLength > 15);
         animationId = requestAnimationFrame(checkAudioLevel);
       };
       checkAudioLevel();
       return () => {
         cancelAnimationFrame(animationId);
-        if (audioCtx && audioCtx.state !== 'closed') audioCtx.close();
+        if (audioCtx && audioCtx.state !== 'closed') audioCtx.close().catch(() => {});
         speakingContextRef.current = null;
+        analyserRef.current = null;
       };
     } catch (e) {
       console.error("Audio API hatası:", e);
@@ -746,6 +807,7 @@ export default function DiscordVoiceApp() {
       gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
       osc.start();
       osc.stop(ctx.currentTime + 0.15);
+      setTimeout(() => ctx.close().catch(() => {}), 300);
     } catch (e) {}
   };
 
@@ -797,9 +859,22 @@ export default function DiscordVoiceApp() {
 
     if (socketRef.current) socketRef.current.emit('leave-room');
 
+    // ✅ TÜM CONTEXT'LERİ TEMİZLE
+    if (gateCleanupRef.current) {
+      gateCleanupRef.current();
+      gateCleanupRef.current = null;
+    }
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
+    }
+    if (speakingContextRef.current && speakingContextRef.current.state !== 'closed') {
+      speakingContextRef.current.close().catch(() => {});
+      speakingContextRef.current = null;
+    }
+    if (playbackContextRef.current && playbackContextRef.current.state !== 'closed') {
+      playbackContextRef.current.close().catch(() => {});
+      playbackContextRef.current = null;
     }
 
     if (localStreamRef.current) {
@@ -823,7 +898,6 @@ export default function DiscordVoiceApp() {
     videoSenders.current = {};
     isRenegotiating.current = {};
 
-    // ✅ Tüm spatial node'ları temizle
     Object.keys(spatialAudioNodes.current).forEach(cleanupSpatialAudio);
 
     setPeers([]);
@@ -834,13 +908,11 @@ export default function DiscordVoiceApp() {
     setIsSpeaking(false);
   };
 
-  // ✅ Koltuk değiştirince mekânsal sesi güncelle
   const changeSeat = (seatIndex) => {
     setLocalSeat(seatIndex);
     localSeatRef.current = seatIndex;
     if (socketRef.current) socketRef.current.emit('update-seat', { seat: seatIndex });
     
-    // ✅ Tüm peer'lerin konumunu yeniden hesapla
     setTimeout(() => {
       Object.keys(spatialAudioNodes.current).forEach(peerId => {
         updateSpatialPosition(peerId);
@@ -984,7 +1056,6 @@ export default function DiscordVoiceApp() {
     setNewMessage('');
   };
 
-  // ✅ Ses seviyesi değiştir — hem gain node hem state
   const updatePeerVolume = (peerId, vol) => {
     setUserVolumes((prev) => ({ ...prev, [peerId]: vol }));
     updateSpatialGain(peerId, vol);
@@ -1001,7 +1072,6 @@ export default function DiscordVoiceApp() {
     });
   };
 
-  // ==================== YERLEŞİM ====================
   const activePeerWithVideo = peers.find((p) => {
     if (!p.stream) return false;
     return p.stream.getVideoTracks().some(
@@ -1016,7 +1086,7 @@ export default function DiscordVoiceApp() {
     return roomList[channelId] || [];
   };
 
-  // ==================== LOADER EKRANI ====================
+  // ==================== LOADER ====================
   if (connectionState !== 'connected') {
     return (
       <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none items-center justify-center relative">
@@ -1227,7 +1297,6 @@ export default function DiscordVoiceApp() {
               </div>
             )}
 
-            {/* ✅ Chat butonu — okunmamış sayacı badge'i ile */}
             {inCall && (
               <button 
                 onClick={() => setShowChat(!showChat)} 
@@ -1383,7 +1452,6 @@ export default function DiscordVoiceApp() {
                   })}
                 </div>
 
-                {/* Alt bilgi paneli */}
                 <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-[#1e1f22]/90 backdrop-blur-md border border-[#2b2d31] px-4 py-2 rounded-lg text-xs text-[#949ba4] z-20 flex items-center gap-3">
                   <span className="flex items-center gap-1">
                     <div className="w-3 h-3 rounded-full bg-[#5865f2]" /> Sen
@@ -1399,7 +1467,6 @@ export default function DiscordVoiceApp() {
             )}
           </div>
 
-          {/* ✅ Chat paneli — sadece açıksa göster */}
           {inCall && showChat && (
             <div className="w-80 bg-[#313338] border-l border-[#1f2023] flex flex-col shrink-0 z-20">
               <div className="h-10 border-b border-[#1f2023] px-3 flex items-center justify-between text-xs font-bold text-white shadow-sm">
@@ -1624,11 +1691,10 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
   useEffect(() => {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
-      videoRef.current.muted = isDeafened;
-      videoRef.current.volume = Math.min(Math.max(volume, 0), 1);
+      videoRef.current.muted = true; // ✅ Ses WebAudio'dan geliyor
       videoRef.current.play().catch(() => {});
     }
-  }, [stream, isDeafened, volume]);
+  }, [stream]);
 
   useEffect(() => {
     if (!stream) {
@@ -1660,7 +1726,6 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
     };
   }, [stream]);
 
-  // ✅ Mekânsal ses için video elementini sessize al (audio Web Audio API'den geliyor)
   return (
     <div className={`bg-[#111214] rounded-xl relative flex items-center justify-center border border-[#1f2023] overflow-hidden shadow-md transition-all ${isSmall ? 'h-full w-full' : 'w-full h-full aspect-video'}`}>
       <video 
