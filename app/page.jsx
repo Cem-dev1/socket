@@ -15,7 +15,6 @@ const getSocketUrl = () => {
 };
 
 const SOCKET_URL = getSocketUrl();
-let socket;
 
 const CHANNELS = [
   { id: 'genel-oda', name: 'Genel Sohbet' },
@@ -60,7 +59,11 @@ export default function DiscordVoiceApp() {
   const [peerSeats, setPeerSeats] = useState({});
 
   const [peers, setPeers] = useState([]);
+  // Kanal bazlı kullanıcı listesi: { channelId: [socketId, ...] }
+  const [channelUsers, setChannelUsers] = useState({});
 
+  // Refs
+  const socketRef = useRef(null);
   const localStreamRef = useRef(null);
   const localVideoRef = useRef(null);
   const peerConnections = useRef({});
@@ -74,18 +77,19 @@ export default function DiscordVoiceApp() {
   const isVideoOnRef = useRef(false);
   const isScreenSharingRef = useRef(false);
   const inCallRef = useRef(false);
+  const activeChannelRef = useRef('genel-oda');
+  const mySocketIdRef = useRef(null);
 
-  // ✅ Perfect negotiation için polite/impolite belirleme
-  // Her peer için "polite" olup olmadığımızı tutar
+  // Perfect negotiation state
   const politeFlags = useRef({});
   const makingOffer = useRef({});
   const ignoreOffer = useRef({});
   const pendingCandidates = useRef({});
-  const localStreamVersion = useRef(0);
 
   useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
   useEffect(() => { inCallRef.current = inCall; }, [inCall]);
+  useEffect(() => { activeChannelRef.current = activeChannel; }, [activeChannel]);
 
   // ==================== SES İŞLEME ====================
   const applyAudioProcessing = async (rawStream) => {
@@ -131,23 +135,18 @@ export default function DiscordVoiceApp() {
     return null;
   };
 
-  // ✅ Yerel stream'e video track ekle (replaceTrack için tek kaynak)
-  const rebuildLocalStream = () => {
-    if (!localStreamRef.current) return;
-    const audioTracks = localStreamRef.current.getAudioTracks();
-    const newStream = new MediaStream();
-    audioTracks.forEach(t => newStream.addTrack(t));
-    
-    const videoTrack = getOutgoingVideoTrack();
-    if (videoTrack) newStream.addTrack(videoTrack);
-    
-    localStreamRef.current = newStream;
-    setActiveLocalStream(newStream);
-    localStreamVersion.current += 1;
+  const findVideoTransceiver = (pc) => {
+    return pc.getTransceivers().find(
+      (t) => t.receiver?.track?.kind === 'video' || t.sender?.track?.kind === 'video'
+    );
   };
 
-  // ==================== PERFECT NEGOTIATION ====================
+  // ==================== WEBRTC ====================
   const createPeerConnection = (userId, isPolite = false) => {
+    if (peerConnections.current[userId]) {
+      return peerConnections.current[userId];
+    }
+
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -162,15 +161,14 @@ export default function DiscordVoiceApp() {
     pendingCandidates.current[userId] = [];
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socket.emit('ice-candidate', { target: userId, candidate: event.candidate });
+      if (event.candidate && socketRef.current) {
+        socketRef.current.emit('ice-candidate', { target: userId, candidate: event.candidate });
       }
     };
 
     pc.ontrack = (event) => {
       console.log(`[WebRTC] Track - peer: ${userId}, tür: ${event.track.kind}`);
       const remoteStream = event.streams[0];
-      
       setPeers((prev) => {
         const existing = prev.find((p) => p.id === userId);
         if (existing) {
@@ -181,9 +179,8 @@ export default function DiscordVoiceApp() {
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`[WebRTC] Peer ${userId} durumu: ${pc.connectionState}`);
+      console.log(`[WebRTC] ${userId}: ${pc.connectionState}`);
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        // Bağlantı koptuysa yeniden kur
         if (peerConnections.current[userId] === pc) {
           pc.close();
           delete peerConnections.current[userId];
@@ -192,39 +189,42 @@ export default function DiscordVoiceApp() {
       }
     };
 
-    // ✅ Yerel track'leri ekle
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
+      localStreamRef.current.getAudioTracks().forEach((track) => {
         pc.addTrack(track, localStreamRef.current);
       });
     }
 
-    // ✅ Video için boş transceiver oluştur (replaceTrack için hazır)
-    if (!getOutgoingVideoTrack()) {
-      pc.addTransceiver('video', { direction: 'sendrecv' });
+    pc.addTransceiver('video', { direction: 'sendrecv' });
+
+    const activeVideo = getOutgoingVideoTrack();
+    if (activeVideo) {
+      const transceiver = findVideoTransceiver(pc);
+      if (transceiver?.sender) {
+        transceiver.sender.replaceTrack(activeVideo).catch(console.error);
+      }
     }
 
     return pc;
   };
 
-  // ✅ Offer gönder (state kontrolü ile)
   const sendOffer = async (userId) => {
     const pc = peerConnections.current[userId];
-    if (!pc) return;
+    if (!pc || !socketRef.current) return;
     if (pc.signalingState !== 'stable') {
-      console.warn(`[Reneg] ${userId} için state stable değil: ${pc.signalingState}`);
+      console.warn(`[Reneg] ${userId} stable değil: ${pc.signalingState}`);
       return;
     }
     try {
       makingOffer.current[userId] = true;
       const offer = await pc.createOffer();
-      // State değişmiş olabilir, tekrar kontrol
       if (pc.signalingState !== 'stable') {
         makingOffer.current[userId] = false;
         return;
       }
       await pc.setLocalDescription(offer);
-      socket.emit('offer', { target: userId, signal: pc.localDescription });
+      socketRef.current.emit('offer', { target: userId, signal: pc.localDescription });
+      console.log(`[Offer] Gönderildi: ${userId}`);
     } catch (e) {
       console.error('Offer hatası:', e);
     } finally {
@@ -234,31 +234,48 @@ export default function DiscordVoiceApp() {
 
   // ==================== SOCKET ====================
   useEffect(() => {
-    socket = io(SOCKET_URL, {
+    if (socketRef.current) return;
+
+    const newSocket = io(SOCKET_URL, {
       transports: ['polling', 'websocket'],
       reconnection: true,
-      reconnectionAttempts: 5,
+      reconnectionAttempts: 10,
       reconnectionDelay: 1000,
     });
+    socketRef.current = newSocket;
 
-    const pingInterval = setInterval(() => {
-      setPing(Math.floor(Math.random() * 15) + 10);
-    }, 4000);
+    newSocket.on('connect', () => {
+      mySocketIdRef.current = newSocket.id;
+      console.log('✅ Socket bağlandı:', newSocket.id);
+    });
 
-    // ✅ YENİ: Odaya girdiğimizde mevcut üyelerin listesini alırız
-    socket.on('existing-members', async ({ members }) => {
-      console.log('[Socket] Mevcut üyeler:', members);
+    newSocket.on('connect_error', (err) => {
+      console.error('❌ Socket hatası:', err.message);
+    });
+
+    newSocket.on('existing-members', async ({ members }) => {
+      console.log('📋 Mevcut üyeler:', members);
+      if (!members || members.length === 0) return;
+
       for (const peerId of members) {
-        if (peerId === socket.id) continue;
+        if (peerId === newSocket.id) continue;
         if (!peerConnections.current[peerId]) {
-          // ✅ Biz "impolite" olalım — biz offer atarız
-          const pc = createPeerConnection(peerId, false);
-          await sendOffer(peerId);
+          console.log(`🔗 Yeni peer: ${peerId}`);
+          createPeerConnection(peerId, false);
+          try {
+            await sendOffer(peerId);
+          } catch (err) {
+            console.error(`Offer hatası ${peerId}:`, err);
+            setTimeout(() => {
+              if (peerConnections.current[peerId]) sendOffer(peerId);
+            }, 500);
+          }
         }
       }
     });
 
-    socket.on('user-connected', async (userId) => {
+    newSocket.on('user-connected', (userId) => {
+      console.log('👋 Yeni kullanıcı:', userId);
       playSfx('join');
       setMessages((prev) => [...prev, { 
         user: 'Sistem', 
@@ -266,18 +283,15 @@ export default function DiscordVoiceApp() {
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
       }]);
 
-      // ✅ Yeni gelen kişi offer atacak, biz bekleyelim
-      // Ama yine de connection objesi oluştur (cevap alabilmek için)
       if (!peerConnections.current[userId]) {
-        createPeerConnection(userId, true); // polite
+        createPeerConnection(userId, true);
       }
     });
 
-    socket.on('offer', async (data) => {
+    newSocket.on('offer', async (data) => {
       const { caller, signal } = data;
+      console.log('📨 Offer geldi:', caller);
       let pc = peerConnections.current[caller];
-      
-      // Yoksa oluştur — biz polite olalım (gelen offer'a boyun eğeriz)
       if (!pc) {
         pc = createPeerConnection(caller, true);
       }
@@ -286,12 +300,8 @@ export default function DiscordVoiceApp() {
         const offerCollision = makingOffer.current[caller] || pc.signalingState !== 'stable';
         ignoreOffer.current[caller] = !politeFlags.current[caller] && offerCollision;
 
-        if (ignoreOffer.current[caller]) {
-          console.log(`[PerfectNeg] Offer ignore - peer: ${caller}`);
-          return;
-        }
+        if (ignoreOffer.current[caller]) return;
 
-        // Polite taraf isek ve çakışma varsa rollback
         if (offerCollision && politeFlags.current[caller]) {
           await Promise.all([
             pc.setLocalDescription({ type: 'rollback' }),
@@ -301,7 +311,6 @@ export default function DiscordVoiceApp() {
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
         }
 
-        // Bekleyen ICE candidate'leri ekle
         for (const c of pendingCandidates.current[caller] || []) {
           try { await pc.addIceCandidate(c); } catch (e) {}
         }
@@ -309,57 +318,60 @@ export default function DiscordVoiceApp() {
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.emit('answer', { target: caller, signal: pc.localDescription });
+        newSocket.emit('answer', { target: caller, signal: pc.localDescription });
+        console.log(`[Answer] Gönderildi: ${caller}`);
       } catch (e) {
         console.error('[Offer] Hata:', e);
       }
     });
 
-    socket.on('answer', async (data) => {
+    newSocket.on('answer', async (data) => {
       const pc = peerConnections.current[data.id];
       if (!pc) return;
       try {
         if (pc.signalingState === 'have-local-offer') {
           await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
-          // Bekleyen ICE'leri ekle
           for (const c of pendingCandidates.current[data.id] || []) {
             try { await pc.addIceCandidate(c); } catch (e) {}
           }
           pendingCandidates.current[data.id] = [];
+          console.log(`[Answer] Alındı: ${data.id}`);
         }
       } catch (e) {
         console.error('[Answer] Hata:', e);
       }
     });
 
-    socket.on('ice-candidate', async (data) => {
+    newSocket.on('ice-candidate', async (data) => {
       const pc = peerConnections.current[data.id];
+      const candidate = new RTCIceCandidate(data.candidate);
       if (!pc) {
         if (!pendingCandidates.current[data.id]) pendingCandidates.current[data.id] = [];
-        pendingCandidates.current[data.id].push(new RTCIceCandidate(data.candidate));
+        pendingCandidates.current[data.id].push(candidate);
         return;
       }
       try {
         if (pc.remoteDescription && pc.remoteDescription.type) {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          await pc.addIceCandidate(candidate);
         } else {
           if (!pendingCandidates.current[data.id]) pendingCandidates.current[data.id] = [];
-          pendingCandidates.current[data.id].push(new RTCIceCandidate(data.candidate));
+          pendingCandidates.current[data.id].push(candidate);
         }
       } catch (e) {
         if (e.name !== 'OperationError') console.warn('ICE hatası:', e);
       }
     });
 
-    socket.on('chat-message', (msg) => {
+    newSocket.on('chat-message', (msg) => {
       setMessages((prev) => [...prev, msg]);
     });
 
-    socket.on('seat-update', (data) => {
+    newSocket.on('seat-update', (data) => {
       setPeerSeats((prev) => ({ ...prev, [data.userId]: data.seat }));
     });
 
-    socket.on('user-disconnected', (userId) => {
+    newSocket.on('user-disconnected', (userId) => {
+      console.log('👋 Ayrıldı:', userId);
       playSfx('leave');
       setMessages((prev) => [...prev, { 
         user: 'Sistem', 
@@ -383,18 +395,46 @@ export default function DiscordVoiceApp() {
       });
     });
 
-    // ✅ Sayfa kapatılırken temizlik
+    const pingInterval = setInterval(() => {
+      setPing(Math.floor(Math.random() * 15) + 10);
+    }, 4000);
+
     const handleBeforeUnload = () => {
-      if (socket) socket.disconnect();
+      newSocket.disconnect();
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
       clearInterval(pingInterval);
       window.removeEventListener('beforeunload', handleBeforeUnload);
-      if (socket) socket.disconnect();
+      newSocket.disconnect();
+      socketRef.current = null;
     };
   }, []);
+
+  // ==================== KANAL KULLANICI LİSTESİ TAKİBİ ====================
+  // inCall + activeChannel + peers + kendi id üzerinden güncelle
+  useEffect(() => {
+    if (!inCall) {
+      // Aramada değilsek sadece kendi kanalımızdaki diğerleri dursun
+      setChannelUsers((prev) => {
+        const next = { ...prev };
+        delete next[activeChannel];
+        return next;
+      });
+      return;
+    }
+
+    const myId = mySocketIdRef.current || socketRef.current?.id;
+    const userList = [];
+    if (myId) userList.push(myId);
+    peers.forEach(p => userList.push(p.id));
+
+    setChannelUsers((prev) => ({
+      ...prev,
+      [activeChannel]: userList,
+    }));
+  }, [inCall, activeChannel, peers]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -407,17 +447,20 @@ export default function DiscordVoiceApp() {
       return;
     }
 
+    const audioTracks = activeLocalStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      setIsSpeaking(false);
+      return;
+    }
+
     try {
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       speakingContextRef.current = audioCtx;
-
       const analyser = audioCtx.createAnalyser();
       analyserRef.current = analyser;
       analyser.fftSize = 512;
-
       const microphone = audioCtx.createMediaStreamSource(activeLocalStream);
       microphone.connect(analyser);
-
       const bufferLength = analyser.frequencyBinCount;
       const dataArray = new Uint8Array(bufferLength);
 
@@ -439,10 +482,10 @@ export default function DiscordVoiceApp() {
       };
     } catch (e) {
       console.error("Audio API hatası:", e);
+      setIsSpeaking(false);
     }
   }, [activeLocalStream, isMuted, isDeafened]);
 
-  // ==================== YEREL VİDEO ÖNİZLEME ====================
   useEffect(() => {
     if (localVideoRef.current && activeLocalStream) {
       localVideoRef.current.srcObject = activeLocalStream;
@@ -458,7 +501,6 @@ export default function DiscordVoiceApp() {
       const gain = ctx.createGain();
       osc.connect(gain);
       gain.connect(ctx.destination);
-
       if (type === 'join') {
         osc.frequency.setValueAtTime(440, ctx.currentTime);
         osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.15);
@@ -466,7 +508,6 @@ export default function DiscordVoiceApp() {
         osc.frequency.setValueAtTime(880, ctx.currentTime);
         osc.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.15);
       }
-
       gain.gain.setValueAtTime(0.1, ctx.currentTime);
       gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
       osc.start();
@@ -476,7 +517,16 @@ export default function DiscordVoiceApp() {
 
   // ==================== ARAMA KONTROLLERİ ====================
   const startCall = async (channelId) => {
-    if (inCallRef.current) return; // zaten aramadayız
+    if (inCallRef.current) return;
+    inCallRef.current = true;
+
+    const socket = socketRef.current;
+    if (!socket) {
+      console.error('Socket hazır değil!');
+      inCallRef.current = false;
+      return;
+    }
+
     try {
       setActiveChannel(channelId);
       playSfx('join');
@@ -490,14 +540,26 @@ export default function DiscordVoiceApp() {
       localStreamRef.current = processedStream;
       setActiveLocalStream(processedStream);
       setInCall(true);
-      socket.emit('join-room', channelId);
-      socket.emit('update-seat', { seat: localSeat });
+
+      const doJoin = () => {
+        socket.emit('join-room', channelId);
+        socket.emit('update-seat', { seat: localSeat });
+        console.log(`[join-room] ${channelId}`);
+      };
+
+      if (socket.connected) {
+        doJoin();
+      } else {
+        socket.once('connect', doJoin);
+      }
     } catch (err) {
       console.error('Medya erişim hatası:', err);
+      inCallRef.current = false;
     }
   };
 
   const endCall = () => {
+    inCallRef.current = false;
     playSfx('leave');
 
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
@@ -523,8 +585,9 @@ export default function DiscordVoiceApp() {
     makingOffer.current = {};
     ignoreOffer.current = {};
     pendingCandidates.current = {};
-    
+
     setPeers([]);
+    setChannelUsers({});
     setInCall(false);
     setIsVideoOn(false);
     setIsScreenSharing(false);
@@ -534,7 +597,7 @@ export default function DiscordVoiceApp() {
 
   const changeSeat = (seatIndex) => {
     setLocalSeat(seatIndex);
-    socket.emit('update-seat', { seat: seatIndex });
+    if (socketRef.current) socketRef.current.emit('update-seat', { seat: seatIndex });
   };
 
   const toggleMute = () => {
@@ -559,7 +622,7 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ✅ KAMERA AÇ/KAPAT — düzgün replaceTrack ve renegotiation
+  // ==================== KAMERA ====================
   const toggleVideo = async () => {
     if (!localStreamRef.current) return;
 
@@ -567,36 +630,27 @@ export default function DiscordVoiceApp() {
       if (isScreenSharingRef.current) stopScreenShare();
 
       try {
-        const camStream = await navigator.mediaDevices.getUserMedia({
-          video: VIDEO_CONSTRAINTS,
-        });
+        const camStream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
         cameraStreamRef.current = camStream;
         const videoTrack = camStream.getVideoTracks()[0];
 
-        // Peer'lere video gönder
         for (const [peerId, pc] of Object.entries(peerConnections.current)) {
-          const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video');
-          if (videoSender) {
-            await videoSender.replaceTrack(videoTrack);
+          const transceiver = findVideoTransceiver(pc);
+          if (transceiver?.sender) {
+            await transceiver.sender.replaceTrack(videoTrack);
           } else {
-            // Transceiver var mı bak (senders'ta track null olabilir)
-            const videoTransceiver = pc.getTransceivers().find(
-              (t) => t.receiver.track?.kind === 'video' || 
-                     (t.sender?.track?.kind === 'video')
-            );
-            if (videoTransceiver) {
-              await videoTransceiver.sender.replaceTrack(videoTrack);
-            } else {
-              pc.addTrack(videoTrack, localStreamRef.current);
-              // ✅ Negotiation gerekli
-              setTimeout(() => {
-                if (peerConnections.current[peerId]) sendOffer(peerId);
-              }, 100);
-            }
+            pc.addTransceiver(videoTrack, { direction: 'sendrecv', streams: [localStreamRef.current] });
+            setTimeout(() => {
+              if (peerConnections.current[peerId]) sendOffer(peerId);
+            }, 100);
           }
         }
 
-        rebuildLocalStream();
+        const combinedStream = new MediaStream([
+          ...localStreamRef.current.getAudioTracks(),
+          videoTrack,
+        ]);
+        setActiveLocalStream(combinedStream);
         setIsVideoOn(true);
 
         videoTrack.onended = () => {
@@ -611,15 +665,18 @@ export default function DiscordVoiceApp() {
       cameraStreamRef.current = null;
 
       for (const pc of Object.values(peerConnections.current)) {
-        const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-        if (sender) await sender.replaceTrack(null);
+        const transceiver = findVideoTransceiver(pc);
+        if (transceiver?.sender) {
+          await transceiver.sender.replaceTrack(null);
+        }
       }
 
       setIsVideoOn(false);
-      rebuildLocalStream();
+      setActiveLocalStream(localStreamRef.current);
     }
   };
 
+  // ==================== EKRAN PAYLAŞIMI ====================
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
       if (isVideoOnRef.current) {
@@ -643,26 +700,24 @@ export default function DiscordVoiceApp() {
         const screenTrack = screenStream.getVideoTracks()[0];
 
         for (const [peerId, pc] of Object.entries(peerConnections.current)) {
-          const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-          if (sender) {
-            await sender.replaceTrack(screenTrack);
+          const transceiver = findVideoTransceiver(pc);
+          if (transceiver?.sender) {
+            await transceiver.sender.replaceTrack(screenTrack);
           } else {
-            const videoTransceiver = pc.getTransceivers().find(
-              (t) => t.receiver.track?.kind === 'video'
-            );
-            if (videoTransceiver) {
-              await videoTransceiver.sender.replaceTrack(screenTrack);
-            } else {
-              pc.addTrack(screenTrack, screenStream);
-              setTimeout(() => {
-                if (peerConnections.current[peerId]) sendOffer(peerId);
-              }, 100);
-            }
+            pc.addTransceiver(screenTrack, { direction: 'sendrecv', streams: [screenStream] });
+            setTimeout(() => {
+              if (peerConnections.current[peerId]) sendOffer(peerId);
+            }, 100);
           }
         }
 
         setIsScreenSharing(true);
-        setActiveLocalStream(screenStream);
+
+        const combinedStream = new MediaStream([
+          ...localStreamRef.current.getAudioTracks(),
+          ...screenStream.getVideoTracks(),
+        ]);
+        setActiveLocalStream(combinedStream);
 
         screenTrack.onended = () => {
           if (isScreenSharingRef.current) stopScreenShare();
@@ -683,8 +738,10 @@ export default function DiscordVoiceApp() {
     setIsScreenSharing(false);
 
     Object.values(peerConnections.current).forEach((pc) => {
-      const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-      if (sender) sender.replaceTrack(null);
+      const transceiver = findVideoTransceiver(pc);
+      if (transceiver?.sender) {
+        transceiver.sender.replaceTrack(null).catch(() => {});
+      }
     });
 
     setActiveLocalStream(localStreamRef.current);
@@ -692,13 +749,13 @@ export default function DiscordVoiceApp() {
 
   const sendMessage = (e) => {
     e.preventDefault();
-    if (!newMessage.trim()) return;
+    if (!newMessage.trim() || !socketRef.current) return;
     const msgData = { 
       user: 'Cem Dev', 
       text: newMessage, 
       time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
     };
-    socket.emit('chat-message', msgData);
+    socketRef.current.emit('chat-message', msgData);
     setMessages((prev) => [...prev, msgData]);
     setNewMessage('');
   };
@@ -727,6 +784,16 @@ export default function DiscordVoiceApp() {
   const isLocalBroadcasting = isVideoOn || isScreenSharing;
   const isAnyBroadcastActive = !!activePeerWithVideo || isLocalBroadcasting;
 
+  // Kanal altındaki kullanıcı listesi için helper
+  const getChannelUsers = (channelId) => {
+    if (inCall && activeChannel === channelId) {
+      const myId = mySocketIdRef.current || socketRef.current?.id || 'me';
+      const list = [myId, ...peers.map(p => p.id)];
+      return list;
+    }
+    return channelUsers[channelId] || [];
+  };
+
   // ==================== JSX ====================
   return (
     <div className="flex h-screen w-screen bg-[#313338] text-[#dbdee1] overflow-hidden font-sans select-none">
@@ -753,21 +820,62 @@ export default function DiscordVoiceApp() {
           </div>
           {CHANNELS.map((channel) => {
             const isCurrentActive = inCall && activeChannel === channel.id;
+            const usersInChannel = getChannelUsers(channel.id);
+            
             return (
-              <div
-                key={channel.id}
-                onClick={() => !inCall && startCall(channel.id)}
-                className={`flex items-center justify-between px-2 py-2 rounded-md transition-all ${
-                  isCurrentActive 
-                    ? 'bg-[#35373c] text-white font-medium' 
-                    : 'hover:bg-[#35373c]/50 hover:text-[#dbdee1] text-[#949ba4] cursor-pointer'
-                }`}
-              >
-                <div className="flex items-center gap-2 truncate">
-                  <Volume2 size={18} className={isCurrentActive ? 'text-[#23a55a]' : 'text-[#80848e]'} />
-                  <span className="text-sm truncate">{channel.name}</span>
+              <div key={channel.id} className="mb-1">
+                <div
+                  onClick={() => !inCall && startCall(channel.id)}
+                  className={`flex items-center justify-between px-2 py-2 rounded-md transition-all ${
+                    isCurrentActive 
+                      ? 'bg-[#35373c] text-white font-medium' 
+                      : 'hover:bg-[#35373c]/50 hover:text-[#dbdee1] text-[#949ba4] cursor-pointer'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 truncate">
+                    <Volume2 size={18} className={isCurrentActive ? 'text-[#23a55a]' : 'text-[#80848e]'} />
+                    <span className="text-sm truncate">{channel.name}</span>
+                  </div>
+                  {isCurrentActive && <span className="w-2 h-2 rounded-full bg-[#23a55a] animate-pulse" />}
                 </div>
-                {isCurrentActive && <span className="w-2 h-2 rounded-full bg-[#23a55a] animate-pulse" />}
+
+                {/* Kanal altındaki kullanıcılar */}
+                {usersInChannel.length > 0 && (
+                  <div className="ml-6 mt-0.5 space-y-0.5">
+                    {usersInChannel.map((userId, idx) => {
+                      const isMe = userId === (mySocketIdRef.current || socketRef.current?.id);
+                      const peer = peers.find(p => p.id === userId);
+                      const peerHasVideo = peer?.stream?.getVideoTracks().some(
+                        t => t.readyState === 'live' && !t.muted
+                      );
+                      const displayName = isMe ? 'Sen' : `Kullanıcı ${userId.slice(0, 4)}`;
+                      
+                      return (
+                        <div
+                          key={userId + idx}
+                          className={`flex items-center gap-2 px-2 py-1 rounded text-xs transition-all ${
+                            isMe 
+                              ? 'text-[#23a55a] font-medium' 
+                              : 'text-[#b5bac1] hover:bg-[#35373c]/50'
+                          }`}
+                        >
+                          <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold ${
+                            isMe ? 'bg-[#23a55a] text-white' : 'bg-indigo-600 text-white'
+                          }`}>
+                            {(isMe ? 'S' : userId.slice(0, 1)).toUpperCase()}
+                          </div>
+                          <span className="truncate flex-1">{displayName}</span>
+                          {peerHasVideo && (
+                            <Video size={11} className="text-[#23a55a]" />
+                          )}
+                          {isMe && isSpeaking && (
+                            <Volume2 size={11} className="text-[#23a55a] animate-pulse" />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             );
           })}
