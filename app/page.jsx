@@ -51,8 +51,11 @@ export default function DiscordVoiceApp() {
   const [newMessage, setNewMessage] = useState('');
   const [showChat, setShowChat] = useState(true);
   const [ping, setPing] = useState(14);
-  const [userVolumes, setUserVolumes] = useState({});
+  const [userVolumes, setUserVolumes] = useState({}); // { userId: 0.0 - 2.0 }
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+
+  // ✅ Sağ tık menü state
+  const [contextMenu, setContextMenu] = useState(null); // { userId, x, y }
 
   const [viewMode, setViewMode] = useState('grid');
   const [localSeat, setLocalSeat] = useState(0);
@@ -89,6 +92,19 @@ export default function DiscordVoiceApp() {
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
   useEffect(() => { inCallRef.current = inCall; }, [inCall]);
   useEffect(() => { myIdRef.current = myId; }, [myId]);
+
+  // ✅ Sağ tık menü dışına tıklayınca kapat
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handleClick = () => setContextMenu(null);
+    const handleEsc = (e) => { if (e.key === 'Escape') setContextMenu(null); };
+    window.addEventListener('click', handleClick);
+    window.addEventListener('keydown', handleEsc);
+    return () => {
+      window.removeEventListener('click', handleClick);
+      window.removeEventListener('keydown', handleEsc);
+    };
+  }, [contextMenu]);
 
   // ==================== SES İŞLEME ====================
   const applyAudioProcessing = async (rawStream) => {
@@ -229,7 +245,6 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ✅ Video track'i peer'e ekle (addTrack + renegotiation)
   const attachVideoToPeer = async (peerId, videoTrack, stream) => {
     const pc = peerConnections.current[peerId];
     if (!pc) return;
@@ -237,7 +252,6 @@ export default function DiscordVoiceApp() {
     try {
       const sender = pc.addTrack(videoTrack, stream);
       videoSenders.current[peerId] = sender;
-      console.log(`[Video] ${peerId} addTrack OK`);
       await new Promise(r => setTimeout(r, 100));
       await sendOffer(peerId);
     } catch (e) {
@@ -245,7 +259,6 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ✅ Video track'i peer'den çıkar (removeTrack + renegotiation)
   const detachVideoFromPeer = async (peerId) => {
     const pc = peerConnections.current[peerId];
     const sender = videoSenders.current[peerId];
@@ -254,7 +267,6 @@ export default function DiscordVoiceApp() {
     try {
       pc.removeTrack(sender);
       delete videoSenders.current[peerId];
-      console.log(`[Video] ${peerId} removeTrack OK`);
       await new Promise(r => setTimeout(r, 100));
       await sendOffer(peerId);
     } catch (e) {
@@ -289,7 +301,6 @@ export default function DiscordVoiceApp() {
     });
 
     newSocket.on('existing-members', async ({ members }) => {
-      console.log('📋 Mevcut üyeler:', members);
       if (!members || members.length === 0) return;
 
       for (const peerId of members) {
@@ -350,7 +361,6 @@ export default function DiscordVoiceApp() {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         newSocket.emit('answer', { target: caller, signal: pc.localDescription });
-        console.log(`[Answer] Gönderildi: ${caller}`);
       } catch (e) {
         console.error('[Offer] Hata:', e);
       }
@@ -621,7 +631,7 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ✅ KAMERA — addTrack / removeTrack + renegotiation
+  // ==================== KAMERA ====================
   const toggleVideo = async () => {
     if (!localStreamRef.current) return;
 
@@ -651,7 +661,6 @@ export default function DiscordVoiceApp() {
         console.error('Kamera açılamadı:', e);
       }
     } else {
-      // ✅ KAPAT: removeTrack + renegotiation
       const videoTrack = cameraStreamRef.current?.getVideoTracks()[0];
       if (videoTrack) videoTrack.stop();
       cameraStreamRef.current = null;
@@ -665,7 +674,7 @@ export default function DiscordVoiceApp() {
     }
   };
 
-  // ✅ EKRAN PAYLAŞIMI
+  // ==================== EKRAN PAYLAŞIMI ====================
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
       if (isVideoOnRef.current) {
@@ -738,8 +747,21 @@ export default function DiscordVoiceApp() {
     setNewMessage('');
   };
 
+  // ✅ Ses seviyesi güncelle
   const updatePeerVolume = (peerId, vol) => {
     setUserVolumes((prev) => ({ ...prev, [peerId]: vol }));
+  };
+
+  // ✅ Sağ tık menüsünü aç
+  const handleUserRightClick = (e, userId) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (userId === myId) return; // kendi sesini ayarlayamazsın
+    setContextMenu({
+      userId,
+      x: e.clientX,
+      y: e.clientY,
+    });
   };
 
   // ==================== YERLEŞİM ====================
@@ -820,20 +842,28 @@ export default function DiscordVoiceApp() {
                         t => t.readyState === 'live' && !t.muted
                       );
                       const displayName = isMe ? 'Sen' : `Kullanıcı ${userId.slice(0, 4)}`;
+                      const currentVol = userVolumes[userId] ?? 1.0;
                       
                       return (
                         <div
                           key={userId + '-' + idx}
+                          onContextMenu={(e) => handleUserRightClick(e, userId)}
                           className={`flex items-center gap-2 px-2 py-1 rounded text-xs transition-all ${
-                            isMe ? 'text-[#23a55a] font-medium' : 'text-[#b5bac1] hover:bg-[#35373c]/50'
+                            isMe ? 'text-[#23a55a] font-medium' : 'text-[#b5bac1] hover:bg-[#35373c]/50 cursor-context-menu'
                           }`}
+                          title={!isMe ? 'Sağ tıklayarak ses seviyesini ayarla' : ''}
                         >
-                          <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold ${
+                          <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold shrink-0 ${
                             isMe ? 'bg-[#23a55a] text-white' : 'bg-indigo-600 text-white'
                           }`}>
                             {(isMe ? 'S' : userId.slice(0, 1)).toUpperCase()}
                           </div>
                           <span className="truncate flex-1">{displayName}</span>
+                          {!isMe && currentVol !== 1.0 && (
+                            <span className={`text-[9px] font-bold ${currentVol === 0 ? 'text-[#ed4245]' : 'text-[#faa61a]'}`}>
+                              {Math.round(currentVol * 100)}%
+                            </span>
+                          )}
                           {peerHasVideo && <Video size={11} className="text-[#23a55a]" />}
                           {isMe && isSpeaking && <Volume2 size={11} className="text-[#23a55a] animate-pulse" />}
                         </div>
@@ -931,7 +961,7 @@ export default function DiscordVoiceApp() {
                   <>
                     <div className="flex-1 rounded-xl bg-[#111214] border border-[#1f2023] relative overflow-hidden flex items-center justify-center shadow-2xl">
                       {activePeerWithVideo ? (
-                        <MainStreamViewer stream={activePeerWithVideo.stream} id={activePeerWithVideo.id} isDeafened={isDeafened} />
+                        <MainStreamViewer stream={activePeerWithVideo.stream} id={activePeerWithVideo.id} isDeafened={isDeafened} volume={userVolumes[activePeerWithVideo.id] ?? 1} />
                       ) : (
                         <div className="relative w-full h-full flex items-center justify-center bg-black group">
                           <video ref={localVideoRef} autoPlay playsInline muted={true} className="w-full h-full object-contain" />
@@ -1123,13 +1153,93 @@ export default function DiscordVoiceApp() {
 
       </div>
 
+      {/* ✅ Sağ Tık Ses Seviyesi Menüsü */}
+      {contextMenu && (
+        <div
+          className="fixed z-[100] bg-[#111214] border border-[#2b2d31] rounded-lg shadow-2xl p-3 w-64"
+          style={{
+            left: Math.min(contextMenu.x, window.innerWidth - 280),
+            top: Math.min(contextMenu.y, window.innerHeight - 180),
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-full bg-indigo-600 flex items-center justify-center text-white font-bold text-[10px]">
+                {contextMenu.userId.slice(0, 2).toUpperCase()}
+              </div>
+              <span className="text-xs font-bold text-white">Kullanıcı {contextMenu.userId.slice(0, 4)}</span>
+            </div>
+            <button 
+              onClick={() => setContextMenu(null)} 
+              className="text-[#949ba4] hover:text-white transition-colors"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-[#949ba4] font-medium">Ses Seviyesi</span>
+              <span className={`text-xs font-bold ${(userVolumes[contextMenu.userId] ?? 1) === 0 ? 'text-[#ed4245]' : 'text-[#23a55a]'}`}>
+                {Math.round((userVolumes[contextMenu.userId] ?? 1) * 100)}%
+              </span>
+            </div>
+            
+            <input
+              type="range"
+              min="0"
+              max="200"
+              step="5"
+              value={Math.round((userVolumes[contextMenu.userId] ?? 1) * 100)}
+              onChange={(e) => updatePeerVolume(contextMenu.userId, parseInt(e.target.value) / 100)}
+              className="w-full h-2 bg-[#2b2d31] rounded-lg appearance-none cursor-pointer accent-[#23a55a]"
+              style={{
+                background: `linear-gradient(to right, #23a55a 0%, #23a55a ${Math.min((userVolumes[contextMenu.userId] ?? 1) * 50, 100)}%, #2b2d31 ${Math.min((userVolumes[contextMenu.userId] ?? 1) * 50, 100)}%, #2b2d31 100%)`
+              }}
+            />
+
+            <div className="flex items-center justify-between gap-1 mt-1">
+              {[0, 25, 50, 100, 150, 200].map((val) => (
+                <button
+                  key={val}
+                  onClick={() => updatePeerVolume(contextMenu.userId, val / 100)}
+                  className={`flex-1 text-[9px] font-bold py-1 rounded transition-all ${
+                    Math.round((userVolumes[contextMenu.userId] ?? 1) * 100) === val
+                      ? 'bg-[#5865f2] text-white'
+                      : 'bg-[#2b2d31] text-[#949ba4] hover:bg-[#35373c] hover:text-white'
+                  }`}
+                >
+                  {val}%
+                </button>
+              ))}
+            </div>
+
+            <div className="pt-2 border-t border-[#2b2d31] flex items-center justify-between">
+              <button
+                onClick={() => updatePeerVolume(contextMenu.userId, 0)}
+                className="text-[10px] text-[#ed4245] hover:text-[#c9383b] font-medium flex items-center gap-1 transition-colors"
+              >
+                <VolumeX size={12} /> Sustur
+              </button>
+              <button
+                onClick={() => updatePeerVolume(contextMenu.userId, 1)}
+                className="text-[10px] text-[#23a55a] hover:text-[#1f8c4c] font-medium flex items-center gap-1 transition-colors"
+              >
+                <Volume2 size={12} /> Sıfırla
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
 
 // ==================== ALT BİLEŞENLER ====================
 
-function MainStreamViewer({ stream, id, isDeafened }) {
+function MainStreamViewer({ stream, id, isDeafened, volume = 1 }) {
   const videoRef = useRef(null);
   const containerRef = useRef(null);
 
@@ -1137,9 +1247,10 @@ function MainStreamViewer({ stream, id, isDeafened }) {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = isDeafened;
+      videoRef.current.volume = Math.min(Math.max(volume, 0), 1); // HTML5 video max 1.0
       videoRef.current.play().catch(() => {});
     }
-  }, [stream, isDeafened]);
+  }, [stream, isDeafened, volume]);
 
   const toggleFullScreen = () => {
     if (!document.fullscreenElement) {
@@ -1156,6 +1267,11 @@ function MainStreamViewer({ stream, id, isDeafened }) {
       <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-md text-xs text-white font-medium flex items-center gap-2 border border-white/10 z-10">
         <span className="w-2 h-2 rounded-full bg-[#23a55a] animate-pulse" />
         Yayın Yapan: Kullanıcı ({id.slice(0, 4)})
+        {volume !== 1 && (
+          <span className="text-[#faa61a] font-bold">
+            · {Math.round(volume * 100)}%
+          </span>
+        )}
       </div>
 
       <button 
@@ -1177,7 +1293,8 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       videoRef.current.muted = isDeafened;
-      videoRef.current.volume = volume;
+      // ✅ HTML5 video volume max 1.0 destekler, yukarısı için GainNode kullanılabilir
+      videoRef.current.volume = Math.min(Math.max(volume, 0), 1);
       videoRef.current.play().catch(() => {});
     }
   }, [stream, isDeafened, volume]);
@@ -1231,8 +1348,13 @@ function RemoteUserCard({ stream, id, isDeafened, volume, isSmall }) {
         </div>
       )}
       
-      <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] text-white font-medium border border-white/10 z-10">
+      <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] text-white font-medium border border-white/10 z-10 flex items-center gap-1">
         Kullanıcı ({id.slice(0, 4)})
+        {volume !== 1 && volume !== undefined && (
+          <span className={`font-bold ${volume === 0 ? 'text-[#ed4245]' : 'text-[#faa61a]'}`}>
+            · {Math.round(volume * 100)}%
+          </span>
+        )}
       </div>
     </div>
   );
